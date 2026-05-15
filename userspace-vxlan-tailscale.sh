@@ -24,8 +24,8 @@ TAP_IFACE="tapvx100"
 BRIDGE_IFACE=""
 MANAGE_BRIDGE="0"
 PHYS_IFACES=""
-DETACH_PHYS_ON_STOP="0"
-REMOVE_MANAGED_BRIDGE_ON_STOP="0"
+DETACH_PHYS_ON_STOP="1"
+REMOVE_MANAGED_BRIDGE_ON_STOP="1"
 VXLAN_PORT="4789"
 LOCAL_LISTEN="0.0.0.0:${VXLAN_PORT}"
 PEERS=""
@@ -193,8 +193,8 @@ reset_tunnel_defaults() {
     BRIDGE_IFACE=""
     MANAGE_BRIDGE="0"
     PHYS_IFACES=""
-    DETACH_PHYS_ON_STOP="0"
-    REMOVE_MANAGED_BRIDGE_ON_STOP="0"
+    DETACH_PHYS_ON_STOP="1"
+    REMOVE_MANAGED_BRIDGE_ON_STOP="1"
     VXLAN_PORT="4789"
     LOCAL_LISTEN="0.0.0.0:4789"
     PEERS=""
@@ -218,8 +218,8 @@ load_config() {
     LOCAL_LISTEN="${LOCAL_LISTEN:-0.0.0.0:${VXLAN_PORT}}"
     MANAGE_BRIDGE="${MANAGE_BRIDGE:-0}"
     PHYS_IFACES="${PHYS_IFACES:-}"
-    DETACH_PHYS_ON_STOP="${DETACH_PHYS_ON_STOP:-0}"
-    REMOVE_MANAGED_BRIDGE_ON_STOP="${REMOVE_MANAGED_BRIDGE_ON_STOP:-0}"
+    DETACH_PHYS_ON_STOP="${DETACH_PHYS_ON_STOP:-1}"
+    REMOVE_MANAGED_BRIDGE_ON_STOP="${REMOVE_MANAGED_BRIDGE_ON_STOP:-1}"
     GITHUB_REPO="${GITHUB_REPO:-Frankzhang854/userspace-vxlan}"
     RELEASE_VERSION="${RELEASE_VERSION:-latest}"
     DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
@@ -272,8 +272,8 @@ PHYS_IFACES=""
 ALLOW_IFACE_WITH_IP="1"
 
 # Cleanup options. Keep disabled on real devices unless this bridge is dedicated.
-DETACH_PHYS_ON_STOP="0"
-REMOVE_MANAGED_BRIDGE_ON_STOP="0"
+DETACH_PHYS_ON_STOP="1"
+REMOVE_MANAGED_BRIDGE_ON_STOP="1"
 
 VXLAN_PORT="4789"
 LOCAL_LISTEN="0.0.0.0:4789"
@@ -542,8 +542,8 @@ create_tunnel_wizard() {
     GITHUB_DIRECT_CHECK_TIMEOUT="${GITHUB_DIRECT_CHECK_TIMEOUT:-8}"
     PID_FILE="${PID_FILE:-/var/run/userspace-vxlan-tailscale.pid}"
     LOG_FILE="${LOG_FILE:-/var/log/userspace-vxlan-tailscale.log}"
-    DETACH_PHYS_ON_STOP="${DETACH_PHYS_ON_STOP:-0}"
-    REMOVE_MANAGED_BRIDGE_ON_STOP="${REMOVE_MANAGED_BRIDGE_ON_STOP:-0}"
+    DETACH_PHYS_ON_STOP="${DETACH_PHYS_ON_STOP:-1}"
+    REMOVE_MANAGED_BRIDGE_ON_STOP="${REMOVE_MANAGED_BRIDGE_ON_STOP:-1}"
     DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
 
     write_config_from_vars
@@ -965,7 +965,10 @@ detach_bridge() {
         done
     fi
     if [ "$REMOVE_MANAGED_BRIDGE_ON_STOP" = "1" ] && [ "$MANAGE_BRIDGE" = "1" ]; then
-        ip link delete "$BRIDGE_IFACE" type bridge >/dev/null 2>&1 || true
+        ip link set dev "$BRIDGE_IFACE" down >/dev/null 2>&1 || true
+        ip link delete dev "$BRIDGE_IFACE" type bridge >/dev/null 2>&1 || \
+            ip link delete dev "$BRIDGE_IFACE" >/dev/null 2>&1 || \
+            ip link delete "$BRIDGE_IFACE" >/dev/null 2>&1 || true
     fi
 }
 
