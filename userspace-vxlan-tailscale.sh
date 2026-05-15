@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="0.2.0-userspace"
+VERSION="0.3.0-userspace"
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
@@ -162,6 +162,256 @@ Release:       $RELEASE_VERSION
 Verify dl:     $VERIFY_DOWNLOAD
 Dl timeout:    $DOWNLOAD_TIMEOUT
 EOF
+}
+
+config_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+write_config_from_vars() {
+    need_root
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat >"$CONFIG_FILE" <<EOF
+# User-space VXLAN over Tailscale/underlay config
+# This backend does not require the kernel vxlan module.
+# Target devices do not need Go installed; the binary is downloaded from GitHub Releases.
+
+TUNNEL_NAME=$(config_quote "$TUNNEL_NAME")
+VNI=$(config_quote "$VNI")
+TAP_IFACE=$(config_quote "$TAP_IFACE")
+
+# Set to br-lan, br0, or another bridge to join a LAN.
+# Leave empty for standalone TAP testing.
+BRIDGE_IFACE=$(config_quote "$BRIDGE_IFACE")
+
+# MANAGE_BRIDGE=1 creates BRIDGE_IFACE when missing.
+# PHYS_IFACES is a comma/space-separated list of physical/member ports to add.
+# Moving a management/uplink port into a bridge can interrupt remote access.
+MANAGE_BRIDGE=$(config_quote "$MANAGE_BRIDGE")
+PHYS_IFACES=$(config_quote "$PHYS_IFACES")
+ALLOW_IFACE_WITH_IP=$(config_quote "$ALLOW_IFACE_WITH_IP")
+
+# Cleanup options. Keep disabled on real devices unless this bridge is dedicated.
+DETACH_PHYS_ON_STOP=$(config_quote "$DETACH_PHYS_ON_STOP")
+REMOVE_MANAGED_BRIDGE_ON_STOP=$(config_quote "$REMOVE_MANAGED_BRIDGE_ON_STOP")
+
+VXLAN_PORT=$(config_quote "$VXLAN_PORT")
+LOCAL_LISTEN=$(config_quote "$LOCAL_LISTEN")
+
+# Comma-separated peer underlay addresses.
+# For Tailscale, use peer Tailscale IPs or MagicDNS names.
+PEERS=$(config_quote "$PEERS")
+
+MTU=$(config_quote "$MTU")
+FRAME_SIZE=$(config_quote "$FRAME_SIZE")
+
+BINARY_PATH=$(config_quote "$BINARY_PATH")
+PID_FILE=$(config_quote "$PID_FILE")
+LOG_FILE=$(config_quote "$LOG_FILE")
+
+# GitHub Release download settings.
+GITHUB_REPO=$(config_quote "$GITHUB_REPO")
+RELEASE_VERSION=$(config_quote "$RELEASE_VERSION")
+DOWNLOAD_BASE_URL=$(config_quote "$DOWNLOAD_BASE_URL")
+VERIFY_DOWNLOAD=$(config_quote "$VERIFY_DOWNLOAD")
+DOWNLOAD_TIMEOUT=$(config_quote "$DOWNLOAD_TIMEOUT")
+EOF
+    ok "Saved config: $CONFIG_FILE"
+}
+
+read_value() {
+    prompt="$1"
+    default="$2"
+    var_name="$3"
+    if [ -n "$default" ]; then
+        printf "%s [%s]: " "$prompt" "$default"
+    else
+        printf "%s: " "$prompt"
+    fi
+    if read -r value; then
+        :
+    else
+        value=""
+    fi
+    if [ -z "$value" ]; then
+        value="$default"
+    fi
+    printf -v "$var_name" '%s' "$value"
+}
+
+ask_yes_no() {
+    prompt="$1"
+    default="$2"
+    while true; do
+        case "$default" in
+            y|Y) suffix="Y/n" ;;
+            *) suffix="y/N" ;;
+        esac
+        printf "%s [%s]: " "$prompt" "$suffix"
+        if read -r answer; then
+            :
+        else
+            answer=""
+        fi
+        if [ -z "$answer" ]; then
+            answer="$default"
+        fi
+        case "$answer" in
+            y|Y|yes|YES|Yes) return 0 ;;
+            n|N|no|NO|No) return 1 ;;
+            *) warn "Please answer y or n." ;;
+        esac
+    done
+}
+
+validate_uint() {
+    name="$1"
+    value="$2"
+    max="$3"
+    case "$value" in
+        ''|*[!0-9]*)
+            err "$name must be a number"
+            return 1
+            ;;
+    esac
+    if [ "$value" -gt "$max" ]; then
+        err "$name must be <= $max"
+        return 1
+    fi
+}
+
+create_tunnel_wizard() {
+    need_root
+    load_config
+
+    echo "Create a user-space VXLAN tunnel"
+    echo "Config file: $CONFIG_FILE"
+    echo
+
+    if [ -f "$CONFIG_FILE" ]; then
+        warn "Config already exists: $CONFIG_FILE"
+        if ! ask_yes_no "Overwrite it and create a backup first?" "n"; then
+            warn "Canceled"
+            return 0
+        fi
+        backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+        cp -p "$CONFIG_FILE" "$backup"
+        ok "Backup saved: $backup"
+    fi
+
+    read_value "Tunnel name" "${TUNNEL_NAME:-uvxlan0}" TUNNEL_NAME
+    read_value "VNI" "${VNI:-100}" VNI
+    validate_uint "VNI" "$VNI" 16777215 || return 1
+
+    default_tap="$TAP_IFACE"
+    if [ -z "$default_tap" ] || [ "$default_tap" = "tapvx100" ]; then
+        default_tap="tapvx${VNI}"
+    fi
+    read_value "TAP interface name" "$default_tap" TAP_IFACE
+
+    read_value "Local UDP listen address" "${LOCAL_LISTEN:-0.0.0.0:4789}" LOCAL_LISTEN
+    read_value "Peer list, comma-separated host:port" "$PEERS" PEERS
+    if [ -z "$PEERS" ]; then
+        warn "PEERS is empty. The tunnel can start, but it will not send flooded frames to remote nodes."
+    fi
+
+    read_value "MTU" "${MTU:-1280}" MTU
+    validate_uint "MTU" "$MTU" 9000 || return 1
+    read_value "Frame buffer size" "${FRAME_SIZE:-1600}" FRAME_SIZE
+    validate_uint "Frame buffer size" "$FRAME_SIZE" 65535 || return 1
+
+    if [ -n "$BRIDGE_IFACE" ]; then
+        default_bridge_answer="y"
+    else
+        default_bridge_answer="n"
+    fi
+    if ask_yes_no "Attach TAP to a Linux bridge/LAN?" "$default_bridge_answer"; then
+        read_value "Bridge interface" "${BRIDGE_IFACE:-br-lan}" BRIDGE_IFACE
+        if [ "${MANAGE_BRIDGE:-0}" = "1" ]; then
+            default_manage_bridge="y"
+        else
+            default_manage_bridge="n"
+        fi
+        if ask_yes_no "Create bridge if it does not exist?" "$default_manage_bridge"; then
+            MANAGE_BRIDGE="1"
+        else
+            MANAGE_BRIDGE="0"
+        fi
+        read_value "Physical/member interfaces to add, comma or space separated" "$PHYS_IFACES" PHYS_IFACES
+        if [ -n "$PHYS_IFACES" ]; then
+            warn "Adding a management/uplink interface to a bridge can interrupt remote access."
+            if [ "${ALLOW_IFACE_WITH_IP:-1}" = "1" ]; then
+                default_allow_ip="y"
+            else
+                default_allow_ip="n"
+            fi
+            if ask_yes_no "Allow adding interfaces that already have IP addresses?" "$default_allow_ip"; then
+                ALLOW_IFACE_WITH_IP="1"
+            else
+                ALLOW_IFACE_WITH_IP="0"
+            fi
+        fi
+    else
+        BRIDGE_IFACE=""
+        MANAGE_BRIDGE="0"
+        PHYS_IFACES=""
+    fi
+
+    read_value "Binary path" "${BINARY_PATH:-/usr/local/bin/tapvxlan-udp}" BINARY_PATH
+    read_value "GitHub repo owner/name" "${GITHUB_REPO:-Frankzhang854/userspace-vxlan}" GITHUB_REPO
+    read_value "Release version for binary download" "${RELEASE_VERSION:-latest}" RELEASE_VERSION
+
+    VXLAN_PORT="${VXLAN_PORT:-4789}"
+    VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-1}"
+    DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-120}"
+    PID_FILE="${PID_FILE:-/var/run/userspace-vxlan-tailscale.pid}"
+    LOG_FILE="${LOG_FILE:-/var/log/userspace-vxlan-tailscale.log}"
+    DETACH_PHYS_ON_STOP="${DETACH_PHYS_ON_STOP:-0}"
+    REMOVE_MANAGED_BRIDGE_ON_STOP="${REMOVE_MANAGED_BRIDGE_ON_STOP:-0}"
+    DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
+
+    write_config_from_vars
+    echo
+    view_tunnel
+
+    if ask_yes_no "Install/download the matching binary now?" "y"; then
+        install_binary || return 1
+    fi
+    if ask_yes_no "Start this tunnel now?" "y"; then
+        start_tunnel || return 1
+    fi
+    if ask_yes_no "Enable autostart on boot?" "n"; then
+        enable_autostart || return 1
+    fi
+}
+
+view_tunnel() {
+    load_config
+    echo "Tunnel summary"
+    echo "  Name:       $TUNNEL_NAME"
+    echo "  VNI:        $VNI"
+    echo "  TAP:        $TAP_IFACE"
+    echo "  Bridge:     ${BRIDGE_IFACE:-<none>}"
+    echo "  Listen:     $LOCAL_LISTEN"
+    echo "  Peers:      ${PEERS:-<empty>}"
+    echo "  MTU:        $MTU"
+    echo "  Config:     $CONFIG_FILE"
+    echo "  Binary:     $BINARY_PATH"
+    if is_running; then
+        echo "  Runtime:    running, pid=$(cat "$PID_FILE")"
+    else
+        echo "  Runtime:    stopped"
+    fi
+
+    if command_exists ip; then
+        if ip link show "$TAP_IFACE" >/dev/null 2>&1; then
+            echo
+            ip -br link show "$TAP_IFACE"
+        fi
+        if [ -n "$BRIDGE_IFACE" ] && ip link show "$BRIDGE_IFACE" >/dev/null 2>&1; then
+            ip -br link show "$BRIDGE_IFACE"
+        fi
+    fi
 }
 
 iface_list() {
@@ -719,45 +969,49 @@ edit_config_hint() {
     echo "  PHYS_IFACES=\"eth0\""
     echo "  LOCAL_LISTEN=\"0.0.0.0:${VXLAN_PORT}\""
     echo "  PEERS=\"peer-tailscale-ip:${VXLAN_PORT}\""
-    echo "  RELEASE_VERSION=\"v0.2.0\""
+    echo "  RELEASE_VERSION=\"v0.3.0\""
 }
 
 menu() {
     while true; do
         echo
         echo "User-space VXLAN over Tailscale control ($VERSION)"
-        echo "1) Init default config"
-        echo "2) Show config/status"
-        echo "3) Doctor/check environment"
-        echo "4) Install binary from GitHub Release"
-        echo "5) Update binary from GitHub Release"
-        echo "6) Start tunnel"
-        echo "7) Stop tunnel"
-        echo "8) Restart tunnel"
-        echo "9) Show logs"
-        echo "10) Enable autostart"
-        echo "11) Disable autostart"
-        echo "12) Update this script from Release"
-        echo "13) Status JSON"
-        echo "14) Config edit hint"
+        echo "1) New tunnel wizard"
+        echo "2) View tunnel summary"
+        echo "3) Init default config"
+        echo "4) Show config/status"
+        echo "5) Doctor/check environment"
+        echo "6) Install binary from GitHub Release"
+        echo "7) Update binary from GitHub Release"
+        echo "8) Start tunnel"
+        echo "9) Stop tunnel"
+        echo "10) Restart tunnel"
+        echo "11) Show logs"
+        echo "12) Enable autostart"
+        echo "13) Disable autostart"
+        echo "14) Update this script from Release"
+        echo "15) Status JSON"
+        echo "16) Config edit hint"
         echo "0) Exit"
         printf "Select: "
         read -r choice
         case "$choice" in
-            1) write_default_config ;;
-            2) status_tunnel ;;
-            3) doctor ;;
-            4) install_binary ;;
-            5) update_binary ;;
-            6) start_tunnel ;;
-            7) stop_tunnel ;;
-            8) restart_tunnel ;;
-            9) show_logs ;;
-            10) enable_autostart ;;
-            11) disable_autostart ;;
-            12) update_script ;;
-            13) status_json ;;
-            14) edit_config_hint ;;
+            1) create_tunnel_wizard ;;
+            2) view_tunnel ;;
+            3) write_default_config ;;
+            4) status_tunnel ;;
+            5) doctor ;;
+            6) install_binary ;;
+            7) update_binary ;;
+            8) start_tunnel ;;
+            9) stop_tunnel ;;
+            10) restart_tunnel ;;
+            11) show_logs ;;
+            12) enable_autostart ;;
+            13) disable_autostart ;;
+            14) update_script ;;
+            15) status_json ;;
+            16) edit_config_hint ;;
             0) exit 0 ;;
             *) warn "Unknown choice" ;;
         esac
@@ -769,6 +1023,9 @@ usage() {
 Usage: $0 COMMAND
 
 Commands:
+  new-tunnel        Interactive wizard: create config, install binary, start
+  create-tunnel     Alias of new-tunnel
+  view-tunnel       Show concise tunnel summary
   init-config       Create default config at $CONFIG_FILE
   config            Show loaded config
   check             Check TAP/Tailscale/bridge environment
@@ -798,6 +1055,8 @@ EOF
 main() {
     cmd="${1:-menu}"
     case "$cmd" in
+        new-tunnel|create-tunnel) create_tunnel_wizard ;;
+        view-tunnel|show-tunnel) view_tunnel ;;
         init-config) write_default_config ;;
         config) show_config ;;
         check) check_env ;;

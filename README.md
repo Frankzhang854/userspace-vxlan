@@ -76,8 +76,8 @@ binaries when a version tag is pushed.
 Create and push a tag:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 The workflow publishes these release assets:
@@ -104,7 +104,7 @@ The control script can download release binaries automatically:
 
 ```bash
 GITHUB_REPO="Frankzhang854/userspace-vxlan"
-RELEASE_VERSION="v0.2.0"
+RELEASE_VERSION="v0.3.0"
 BINARY_PATH="/usr/local/bin/tapvxlan-udp"
 VERIFY_DOWNLOAD="1"
 ```
@@ -120,3 +120,40 @@ The script maps `uname -m` to the matching release asset and verifies it with
 
 `build` is kept as a compatibility alias for `install-binary`; it does not
 compile Go on the target device. Go is only needed in GitHub Actions.
+
+## Control Script Usage
+
+Download the control script on a target device:
+
+```bash
+wget -O userspace-vxlan-tailscale.sh \
+  https://github.com/Frankzhang854/userspace-vxlan/releases/download/v0.3.0/userspace-vxlan-tailscale.sh
+chmod +x userspace-vxlan-tailscale.sh
+```
+
+Use the interactive tunnel wizard:
+
+```bash
+sudo ./userspace-vxlan-tailscale.sh new-tunnel
+```
+
+The wizard asks for the tunnel name, VNI, TAP name, local listen address, peer
+addresses, bridge settings, binary release version, and whether to install,
+start, or enable autostart immediately.
+
+The same wizard is available from the menu:
+
+```bash
+sudo ./userspace-vxlan-tailscale.sh menu
+```
+
+Useful direct commands:
+
+```bash
+sudo ./userspace-vxlan-tailscale.sh view-tunnel
+sudo ./userspace-vxlan-tailscale.sh start
+sudo ./userspace-vxlan-tailscale.sh stop
+sudo ./userspace-vxlan-tailscale.sh status
+sudo ./userspace-vxlan-tailscale.sh doctor
+sudo ./userspace-vxlan-tailscale.sh enable-autostart
+```
