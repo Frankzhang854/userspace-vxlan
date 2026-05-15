@@ -1,0 +1,6 @@
+dist/
+*.log
+*.pid
+*.tmp
+*.bak
+*.disabled-codex

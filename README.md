@@ -103,7 +103,7 @@ The control script can download release binaries automatically:
 
 ```bash
 DOWNLOAD_BINARY="1"
-GITHUB_REPO="owner/repo"
+GITHUB_REPO="Frankzhang854/userspace-vxlan"
 RELEASE_VERSION="v0.1.0"
 BINARY_PATH="/usr/local/bin/tapvxlan-udp"
 AUTO_BUILD="0"
