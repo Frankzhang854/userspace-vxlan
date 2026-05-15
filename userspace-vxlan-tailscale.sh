@@ -43,6 +43,9 @@ GITHUB_ACCELERATOR_MODE="auto"
 GITHUB_ACCELERATOR_URL="https://github.521314666.xyz"
 GITHUB_DIRECT_CHECK_TIMEOUT="8"
 ALLOW_IFACE_WITH_IP="1"
+NETWORK_MANAGER_TYPE="none"
+NM_CONNECTION_ID=""
+NM_UNMANAGED_CONF=""
 TUNNEL_ENABLE_MODE="$DEFAULT_TUNNEL_ENABLE_MODE"
 TUNNEL_AUTO_START_DELAY="$DEFAULT_AUTOSTART_DELAY"
 
@@ -208,6 +211,9 @@ reset_tunnel_defaults() {
     DOWNLOAD_TIMEOUT="120"
     GITHUB_DIRECT_CHECK_TIMEOUT="8"
     ALLOW_IFACE_WITH_IP="1"
+    NETWORK_MANAGER_TYPE="none"
+    NM_CONNECTION_ID=""
+    NM_UNMANAGED_CONF=""
 }
 
 load_config() {
@@ -229,6 +235,9 @@ load_config() {
     GITHUB_ACCELERATOR_URL="${GITHUB_ACCELERATOR_URL:-https://github.521314666.xyz}"
     GITHUB_DIRECT_CHECK_TIMEOUT="${GITHUB_DIRECT_CHECK_TIMEOUT:-8}"
     ALLOW_IFACE_WITH_IP="${ALLOW_IFACE_WITH_IP:-1}"
+    NETWORK_MANAGER_TYPE="${NETWORK_MANAGER_TYPE:-none}"
+    NM_CONNECTION_ID="${NM_CONNECTION_ID:-}"
+    NM_UNMANAGED_CONF="${NM_UNMANAGED_CONF:-}"
     ENABLED="$(normalize_enabled "${ENABLED:-true}")"
 }
 
@@ -298,6 +307,9 @@ DOWNLOAD_TIMEOUT="120"
 GITHUB_ACCELERATOR_MODE="auto"
 GITHUB_ACCELERATOR_URL="https://github.521314666.xyz"
 GITHUB_DIRECT_CHECK_TIMEOUT="8"
+NETWORK_MANAGER_TYPE="none"
+NM_CONNECTION_ID=""
+NM_UNMANAGED_CONF=""
 EOF
     ok "Created config: $CONFIG_FILE"
 }
@@ -332,6 +344,131 @@ EOF
 
 config_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+config_set_kv() {
+    file="$1"
+    key="$2"
+    value="$3"
+    [ -n "$file" ] && [ -f "$file" ] || return 0
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=$(config_quote "$value")|" "$file"
+    else
+        printf '%s=%s\n' "$key" "$(config_quote "$value")" >>"$file"
+    fi
+}
+
+ensure_tunnel_manager_keys() {
+    file="$1"
+    [ -n "$file" ] && [ -f "$file" ] || return 0
+    grep -q '^NETWORK_MANAGER_TYPE=' "$file" 2>/dev/null || printf 'NETWORK_MANAGER_TYPE=%s\n' "$(config_quote "none")" >>"$file"
+    grep -q '^NM_CONNECTION_ID=' "$file" 2>/dev/null || printf 'NM_CONNECTION_ID=%s\n' "$(config_quote "")" >>"$file"
+    grep -q '^NM_UNMANAGED_CONF=' "$file" 2>/dev/null || printf 'NM_UNMANAGED_CONF=%s\n' "$(config_quote "")" >>"$file"
+}
+
+networkmanager_available() {
+    command_exists nmcli || return 1
+    if command_exists systemctl; then
+        systemctl is-active NetworkManager >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+nm_unmanaged_conf_path() {
+    tunnel_name="$1"
+    printf '/etc/NetworkManager/conf.d/userspace-vxlan-%s.conf\n' "$tunnel_name"
+}
+
+backup_manager_state_for_iface() {
+    file="$1"
+    iface="$2"
+    tunnel_name="$3"
+    [ -n "$iface" ] || return 0
+    ensure_tunnel_manager_keys "$file"
+    if networkmanager_available; then
+        if command_exists timeout; then
+            connection_id="$(timeout 3 nmcli -t -f GENERAL.CONNECTION device show "$iface" 2>/dev/null | awk 'NR==1 {sub(/^[^:]*:[[:space:]]*/, ""); print}')"
+        else
+            connection_id="$(nmcli -t -f GENERAL.CONNECTION device show "$iface" 2>/dev/null | awk 'NR==1 {sub(/^[^:]*:[[:space:]]*/, ""); print}')"
+        fi
+        connection_id="${connection_id:---}"
+        config_set_kv "$file" "NETWORK_MANAGER_TYPE" "NetworkManager"
+        config_set_kv "$file" "NM_CONNECTION_ID" "$connection_id"
+        config_set_kv "$file" "NM_UNMANAGED_CONF" "$(nm_unmanaged_conf_path "$tunnel_name")"
+    else
+        config_set_kv "$file" "NETWORK_MANAGER_TYPE" "none"
+        config_set_kv "$file" "NM_CONNECTION_ID" ""
+        config_set_kv "$file" "NM_UNMANAGED_CONF" ""
+    fi
+}
+
+disable_manager_control_for_iface() {
+    file="$1"
+    iface="$2"
+    tunnel_name="$3"
+    [ -n "$iface" ] || return 0
+    backup_manager_state_for_iface "$file" "$iface" "$tunnel_name"
+    if networkmanager_available; then
+        unmanaged_conf="$(nm_unmanaged_conf_path "$tunnel_name")"
+        nm_state="$(nmcli -t -f DEVICE,STATE dev status 2>/dev/null | awk -F: -v dev="$iface" '$1 == dev {print $2; exit}')"
+        if [ -f "$unmanaged_conf" ] && [ "$nm_state" = "unmanaged" ]; then
+            info "$iface already unmanaged by NetworkManager"
+            return 0
+        fi
+        mkdir -p "$(dirname "$unmanaged_conf")"
+        cat >"$unmanaged_conf" <<EOF
+[keyfile]
+unmanaged-devices=interface-name:${iface}
+EOF
+        nmcli general reload >/dev/null 2>&1 || systemctl reload NetworkManager >/dev/null 2>&1 || true
+        nmcli device set "$iface" managed no >/dev/null 2>&1 || true
+        ok "Excluded $iface from NetworkManager"
+    fi
+}
+
+make_iface_pure_l2() {
+    iface="$1"
+    [ -n "$iface" ] || return 0
+    ip link show dev "$iface" >/dev/null 2>&1 || return 0
+    ip addr flush dev "$iface" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.${iface}.disable_ipv6=1" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.${iface}.accept_ra=0" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.${iface}.autoconf=0" >/dev/null 2>&1 || true
+}
+
+restore_iface_l3_defaults() {
+    iface="$1"
+    [ -n "$iface" ] || return 0
+    ip link show dev "$iface" >/dev/null 2>&1 || return 0
+    sysctl -w "net.ipv6.conf.${iface}.disable_ipv6=0" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.${iface}.accept_ra=1" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.${iface}.autoconf=1" >/dev/null 2>&1 || true
+}
+
+restore_manager_control_from_file() {
+    file="$1"
+    [ -n "$file" ] && [ -f "$file" ] || return 0
+    (
+        # shellcheck disable=SC1090
+        . "$file"
+        if [ "${NETWORK_MANAGER_TYPE:-none}" = "NetworkManager" ] && command_exists nmcli; then
+            if [ -n "${NM_UNMANAGED_CONF:-}" ]; then
+                rm -f "$NM_UNMANAGED_CONF" >/dev/null 2>&1 || true
+                nmcli general reload >/dev/null 2>&1 || systemctl reload NetworkManager >/dev/null 2>&1 || true
+            fi
+            first_iface=""
+            set -- $(iface_list "${PHYS_IFACES:-}")
+            first_iface="${1:-}"
+            if [ -n "$first_iface" ]; then
+                nmcli device set "$first_iface" managed yes >/dev/null 2>&1 || true
+                if [ -n "${NM_CONNECTION_ID:-}" ] && [ "$NM_CONNECTION_ID" != "--" ]; then
+                    nmcli connection up id "$NM_CONNECTION_ID" >/dev/null 2>&1 || nmcli device connect "$first_iface" >/dev/null 2>&1 || true
+                else
+                    nmcli device connect "$first_iface" >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+    )
 }
 
 write_config_from_vars() {
@@ -385,6 +522,9 @@ DOWNLOAD_TIMEOUT=$(config_quote "$DOWNLOAD_TIMEOUT")
 GITHUB_ACCELERATOR_MODE=$(config_quote "$GITHUB_ACCELERATOR_MODE")
 GITHUB_ACCELERATOR_URL=$(config_quote "$GITHUB_ACCELERATOR_URL")
 GITHUB_DIRECT_CHECK_TIMEOUT=$(config_quote "$GITHUB_DIRECT_CHECK_TIMEOUT")
+NETWORK_MANAGER_TYPE=$(config_quote "$NETWORK_MANAGER_TYPE")
+NM_CONNECTION_ID=$(config_quote "$NM_CONNECTION_ID")
+NM_UNMANAGED_CONF=$(config_quote "$NM_UNMANAGED_CONF")
 EOF
     ok "Saved config: $CONFIG_FILE"
 }
@@ -928,6 +1068,7 @@ add_iface_to_bridge() {
         err "Interface not found: $member"
         return 1
     fi
+    ip link set dev "$member" nomaster >/dev/null 2>&1 || true
     ip link set dev "$member" up >/dev/null 2>&1 || true
     if command_exists brctl; then
         brctl addif "$bridge" "$member" 2>/dev/null || true
@@ -945,8 +1086,12 @@ prepare_bridge() {
     [ -n "$BRIDGE_IFACE" ] || return 0
     create_bridge_if_needed || return 1
     for iface in $(iface_list "$PHYS_IFACES"); do
+        disable_manager_control_for_iface "$CONFIG_FILE" "$iface" "$TUNNEL_NAME"
+        ip link set dev "$iface" down >/dev/null 2>&1 || true
         add_iface_to_bridge "$iface" "$BRIDGE_IFACE" || return 1
+        make_iface_pure_l2 "$iface"
     done
+    make_iface_pure_l2 "$BRIDGE_IFACE"
     ip link set dev "$BRIDGE_IFACE" up >/dev/null 2>&1 || true
 }
 
@@ -954,6 +1099,8 @@ attach_bridge() {
     [ -n "$BRIDGE_IFACE" ] || return 0
     prepare_bridge || return 1
     add_iface_to_bridge "$TAP_IFACE" "$BRIDGE_IFACE"
+    make_iface_pure_l2 "$TAP_IFACE"
+    make_iface_pure_l2 "$BRIDGE_IFACE"
 }
 
 detach_bridge() {
@@ -962,7 +1109,10 @@ detach_bridge() {
     if [ "$DETACH_PHYS_ON_STOP" = "1" ]; then
         for iface in $(iface_list "$PHYS_IFACES"); do
             ip link set dev "$iface" nomaster >/dev/null 2>&1 || true
+            restore_iface_l3_defaults "$iface"
+            ip link set dev "$iface" up >/dev/null 2>&1 || true
         done
+        restore_manager_control_from_file "$CONFIG_FILE"
     fi
     if [ "$REMOVE_MANAGED_BRIDGE_ON_STOP" = "1" ] && [ "$MANAGE_BRIDGE" = "1" ]; then
         ip link set dev "$BRIDGE_IFACE" down >/dev/null 2>&1 || true
