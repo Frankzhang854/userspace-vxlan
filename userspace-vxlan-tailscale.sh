@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="0.3.0-userspace"
+VERSION="0.4.0-userspace"
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
@@ -33,6 +33,9 @@ RELEASE_VERSION="latest"
 DOWNLOAD_BASE_URL=""
 VERIFY_DOWNLOAD="1"
 DOWNLOAD_TIMEOUT="120"
+GITHUB_ACCELERATOR_MODE="auto"
+GITHUB_ACCELERATOR_URL="https://github.521314666.xyz"
+GITHUB_DIRECT_CHECK_TIMEOUT="8"
 ALLOW_IFACE_WITH_IP="1"
 
 RED=""
@@ -79,6 +82,9 @@ load_config() {
     DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
     VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-1}"
     DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-120}"
+    GITHUB_ACCELERATOR_MODE="${GITHUB_ACCELERATOR_MODE:-auto}"
+    GITHUB_ACCELERATOR_URL="${GITHUB_ACCELERATOR_URL:-https://github.521314666.xyz}"
+    GITHUB_DIRECT_CHECK_TIMEOUT="${GITHUB_DIRECT_CHECK_TIMEOUT:-8}"
     ALLOW_IFACE_WITH_IP="${ALLOW_IFACE_WITH_IP:-1}"
 }
 
@@ -134,6 +140,9 @@ RELEASE_VERSION="latest"
 DOWNLOAD_BASE_URL=""
 VERIFY_DOWNLOAD="1"
 DOWNLOAD_TIMEOUT="120"
+GITHUB_ACCELERATOR_MODE="auto"
+GITHUB_ACCELERATOR_URL="https://github.521314666.xyz"
+GITHUB_DIRECT_CHECK_TIMEOUT="8"
 EOF
     ok "Created config: $CONFIG_FILE"
 }
@@ -161,6 +170,8 @@ GitHub repo:   $GITHUB_REPO
 Release:       $RELEASE_VERSION
 Verify dl:     $VERIFY_DOWNLOAD
 Dl timeout:    $DOWNLOAD_TIMEOUT
+GH accel:      $GITHUB_ACCELERATOR_MODE
+GH accel URL:  $GITHUB_ACCELERATOR_URL
 EOF
 }
 
@@ -215,6 +226,9 @@ RELEASE_VERSION=$(config_quote "$RELEASE_VERSION")
 DOWNLOAD_BASE_URL=$(config_quote "$DOWNLOAD_BASE_URL")
 VERIFY_DOWNLOAD=$(config_quote "$VERIFY_DOWNLOAD")
 DOWNLOAD_TIMEOUT=$(config_quote "$DOWNLOAD_TIMEOUT")
+GITHUB_ACCELERATOR_MODE=$(config_quote "$GITHUB_ACCELERATOR_MODE")
+GITHUB_ACCELERATOR_URL=$(config_quote "$GITHUB_ACCELERATOR_URL")
+GITHUB_DIRECT_CHECK_TIMEOUT=$(config_quote "$GITHUB_DIRECT_CHECK_TIMEOUT")
 EOF
     ok "Saved config: $CONFIG_FILE"
 }
@@ -360,10 +374,16 @@ create_tunnel_wizard() {
     read_value "Binary path" "${BINARY_PATH:-/usr/local/bin/tapvxlan-udp}" BINARY_PATH
     read_value "GitHub repo owner/name" "${GITHUB_REPO:-Frankzhang854/userspace-vxlan}" GITHUB_REPO
     read_value "Release version for binary download" "${RELEASE_VERSION:-latest}" RELEASE_VERSION
+    read_value "GitHub accelerator mode (auto/always/never)" "${GITHUB_ACCELERATOR_MODE:-auto}" GITHUB_ACCELERATOR_MODE
+    if [ "$GITHUB_ACCELERATOR_MODE" != "never" ] && [ "$GITHUB_ACCELERATOR_MODE" != "off" ]; then
+        read_value "GitHub accelerator URL" "${GITHUB_ACCELERATOR_URL:-https://github.521314666.xyz}" GITHUB_ACCELERATOR_URL
+    fi
 
     VXLAN_PORT="${VXLAN_PORT:-4789}"
     VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-1}"
     DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-120}"
+    GITHUB_ACCELERATOR_URL="${GITHUB_ACCELERATOR_URL:-https://github.521314666.xyz}"
+    GITHUB_DIRECT_CHECK_TIMEOUT="${GITHUB_DIRECT_CHECK_TIMEOUT:-8}"
     PID_FILE="${PID_FILE:-/var/run/userspace-vxlan-tailscale.pid}"
     LOG_FILE="${LOG_FILE:-/var/log/userspace-vxlan-tailscale.log}"
     DETACH_PHYS_ON_STOP="${DETACH_PHYS_ON_STOP:-0}"
@@ -440,7 +460,21 @@ detect_binary_asset() {
     esac
 }
 
-download_file() {
+is_github_url() {
+    case "$1" in
+        https://github.com/*) return 0 ;;
+        http://github.com/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+accelerated_url() {
+    url="$1"
+    prefix="${GITHUB_ACCELERATOR_URL%/}"
+    printf '%s/%s\n' "$prefix" "$url"
+}
+
+run_download() {
     url="$1"
     dest="$2"
     if command_exists curl; then
@@ -451,6 +485,72 @@ download_file() {
         err "curl or wget is required"
         return 1
     fi
+}
+
+github_direct_available() {
+    url="$1"
+    if command_exists curl; then
+        curl -fsIL --connect-timeout 5 --max-time "$GITHUB_DIRECT_CHECK_TIMEOUT" "$url" >/dev/null 2>&1
+    elif command_exists wget; then
+        wget --spider -T "$GITHUB_DIRECT_CHECK_TIMEOUT" "$url" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+select_download_url() {
+    url="$1"
+    if ! is_github_url "$url"; then
+        printf '%s\n' "$url"
+        return 0
+    fi
+
+    case "$GITHUB_ACCELERATOR_MODE" in
+        never|off|0|false)
+            printf '%s\n' "$url"
+            ;;
+        always|on|1|true)
+            accelerated_url "$url"
+            ;;
+        auto|'')
+            if github_direct_available "$url"; then
+                info "GitHub direct download is reachable" >&2
+                printf '%s\n' "$url"
+            else
+                warn "GitHub direct download is not reachable; using accelerator" >&2
+                accelerated_url "$url"
+            fi
+            ;;
+        *)
+            warn "Unknown GITHUB_ACCELERATOR_MODE=$GITHUB_ACCELERATOR_MODE; using auto" >&2
+            if github_direct_available "$url"; then
+                printf '%s\n' "$url"
+            else
+                accelerated_url "$url"
+            fi
+            ;;
+    esac
+}
+
+download_file() {
+    url="$1"
+    dest="$2"
+    selected_url="$(select_download_url "$url")"
+
+    if run_download "$selected_url" "$dest"; then
+        return 0
+    fi
+
+    if is_github_url "$url"; then
+        accel_url="$(accelerated_url "$url")"
+        if [ "$selected_url" != "$accel_url" ] && [ "$GITHUB_ACCELERATOR_MODE" != "never" ] && [ "$GITHUB_ACCELERATOR_MODE" != "off" ]; then
+            warn "Direct download failed; retrying with GitHub accelerator"
+            run_download "$accel_url" "$dest"
+            return $?
+        fi
+    fi
+
+    return 1
 }
 
 release_base_url() {
@@ -969,7 +1069,8 @@ edit_config_hint() {
     echo "  PHYS_IFACES=\"eth0\""
     echo "  LOCAL_LISTEN=\"0.0.0.0:${VXLAN_PORT}\""
     echo "  PEERS=\"peer-tailscale-ip:${VXLAN_PORT}\""
-    echo "  RELEASE_VERSION=\"v0.3.0\""
+    echo "  RELEASE_VERSION=\"v0.4.0\""
+    echo "  GITHUB_ACCELERATOR_MODE=\"auto\""
 }
 
 menu() {
