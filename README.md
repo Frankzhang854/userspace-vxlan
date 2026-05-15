@@ -76,8 +76,8 @@ binaries when a version tag is pushed.
 Create and push a tag:
 
 ```bash
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 The workflow publishes these release assets:
@@ -104,7 +104,7 @@ The control script can download release binaries automatically:
 
 ```bash
 GITHUB_REPO="Frankzhang854/userspace-vxlan"
-RELEASE_VERSION="v0.4.0"
+RELEASE_VERSION="v0.5.0"
 BINARY_PATH="/usr/local/bin/tapvxlan-udp"
 VERIFY_DOWNLOAD="1"
 ```
@@ -141,7 +141,7 @@ never   Never use the accelerator.
 For example, when acceleration is needed, the script downloads from:
 
 ```text
-https://github.521314666.xyz/https://github.com/Frankzhang854/userspace-vxlan/releases/download/v0.4.0/tapvxlan-udp-linux-amd64
+https://github.521314666.xyz/https://github.com/Frankzhang854/userspace-vxlan/releases/download/v0.5.0/tapvxlan-udp-linux-amd64
 ```
 
 ## Control Script Usage
@@ -150,33 +150,51 @@ Download the control script on a target device:
 
 ```bash
 wget -O userspace-vxlan-tailscale.sh \
-  https://github.com/Frankzhang854/userspace-vxlan/releases/download/v0.4.0/userspace-vxlan-tailscale.sh
+  https://github.com/Frankzhang854/userspace-vxlan/releases/download/v0.5.0/userspace-vxlan-tailscale.sh
 chmod +x userspace-vxlan-tailscale.sh
 ```
 
-Use the interactive tunnel wizard:
+Use the interactive menu:
 
 ```bash
-sudo ./userspace-vxlan-tailscale.sh new-tunnel
+sudo ./userspace-vxlan-tailscale.sh
 ```
 
-The wizard asks for the tunnel name, VNI, TAP name, local listen address, peer
-addresses, bridge settings, binary release version, GitHub accelerator mode,
-and whether to install, start, or enable autostart immediately.
+The menu follows the kernel VXLAN script style:
 
-The same wizard is available from the menu:
+```text
+1) Create tunnel
+2) Modify tunnel
+3) Show tunnel details
+4) Delete tunnel
+5) Apply all
+6) Set manual MTU
+7) Enable tunnel autostart
+8) Disable tunnel autostart
+9) Set tunnel autostart delay
+10) Show manager status
+11) Uninstall manager and helper
+12) View log
+13) Enable/Switch tunnels
+0) Exit
+```
 
-```bash
-sudo ./userspace-vxlan-tailscale.sh menu
+Each tunnel is saved as an independent config:
+
+```text
+/etc/userspace-vxlan.d/<name>.conf
 ```
 
 Useful direct commands:
 
 ```bash
-sudo ./userspace-vxlan-tailscale.sh view-tunnel
-sudo ./userspace-vxlan-tailscale.sh start
-sudo ./userspace-vxlan-tailscale.sh stop
-sudo ./userspace-vxlan-tailscale.sh status
-sudo ./userspace-vxlan-tailscale.sh doctor
+sudo ./userspace-vxlan-tailscale.sh create NAME
+sudo ./userspace-vxlan-tailscale.sh list
+sudo ./userspace-vxlan-tailscale.sh enable NAME
+sudo ./userspace-vxlan-tailscale.sh disable NAME
+sudo ./userspace-vxlan-tailscale.sh delete NAME
+sudo ./userspace-vxlan-tailscale.sh apply-all
+sudo ./userspace-vxlan-tailscale.sh stop-all
+sudo ./userspace-vxlan-tailscale.sh status-json
 sudo ./userspace-vxlan-tailscale.sh enable-autostart
 ```

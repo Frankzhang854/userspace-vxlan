@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="0.4.0-userspace"
+VERSION="0.5.0-userspace"
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
+GLOBAL_CONFIG="${USVX_GLOBAL_CONFIG:-/etc/userspace-vxlan.conf}"
+CONFIG_DIR="${USVX_CONFIG_DIR:-/etc/userspace-vxlan.d}"
 CONFIG_FILE="${VXLAN_TS_CONFIG:-/etc/userspace-vxlan-tailscale.conf}"
 SERVICE_NAME="userspace-vxlan-tailscale"
 SYSTEMD_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INITD_SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
 SCRIPT_INSTALL_PATH="/usr/local/sbin/userspace-vxlan-tailscale.sh"
+LOG_FILE_GLOBAL="/var/log/userspace-vxlan-manager.log"
+DEFAULT_TUNNEL_ENABLE_MODE="exclusive-by-iface"
+DEFAULT_AUTOSTART_DELAY="0"
 
 TUNNEL_NAME="uvxlan0"
+ENABLED="true"
 VNI="100"
 TAP_IFACE="tapvx100"
 BRIDGE_IFACE=""
@@ -37,6 +43,8 @@ GITHUB_ACCELERATOR_MODE="auto"
 GITHUB_ACCELERATOR_URL="https://github.521314666.xyz"
 GITHUB_DIRECT_CHECK_TIMEOUT="8"
 ALLOW_IFACE_WITH_IP="1"
+TUNNEL_ENABLE_MODE="$DEFAULT_TUNNEL_ENABLE_MODE"
+TUNNEL_AUTO_START_DELAY="$DEFAULT_AUTOSTART_DELAY"
 
 RED=""
 GREEN=""
@@ -67,6 +75,141 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+validate_tunnel_name() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_-]*)
+            return 1
+            ;;
+    esac
+    [ ${#1} -le 9 ]
+}
+
+prompt_tunnel_name() {
+    prompt="${1:-Tunnel name: }"
+    while true; do
+        printf "%s" "$prompt" >&2
+        read -r name
+        if validate_tunnel_name "$name"; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+        warn "Use 1-9 characters: A-Z, a-z, 0-9, underscore, hyphen." >&2
+    done
+}
+
+number_in_range() {
+    value="$1"
+    min="$2"
+    max="$3"
+    case "$value" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]
+}
+
+prompt_number_range() {
+    prompt="$1"
+    default="$2"
+    min="$3"
+    max="$4"
+    while true; do
+        printf "%s" "$prompt" >&2
+        read -r value
+        value="${value:-$default}"
+        if number_in_range "$value" "$min" "$max"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+        warn "Please enter a number from $min to $max." >&2
+    done
+}
+
+normalize_enabled() {
+    value="${1:-true}"
+    case "$value" in
+        false|0|no|off|disabled) echo "false" ;;
+        *) echo "true" ;;
+    esac
+}
+
+ifname_for() {
+    prefix="$1"
+    name="$2"
+    safe="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_-' '_')"
+    printf '%s%s' "$prefix" "$safe" | cut -c1-15
+}
+
+tunnel_config_file() {
+    printf '%s/%s.conf\n' "$CONFIG_DIR" "$1"
+}
+
+ensure_manager_env() {
+    need_root
+    mkdir -p "$CONFIG_DIR" "$(dirname "$GLOBAL_CONFIG")" "$(dirname "$LOG_FILE_GLOBAL")"
+    if [ ! -f "$GLOBAL_CONFIG" ]; then
+        cat >"$GLOBAL_CONFIG" <<EOF
+SCRIPT_PATH=$(config_quote "$SCRIPT_PATH")
+TUNNEL_ENABLE_MODE=$(config_quote "$DEFAULT_TUNNEL_ENABLE_MODE")
+TUNNEL_AUTO_START_DELAY=$(config_quote "$DEFAULT_AUTOSTART_DELAY")
+GITHUB_REPO=$(config_quote "$GITHUB_REPO")
+RELEASE_VERSION=$(config_quote "$RELEASE_VERSION")
+GITHUB_ACCELERATOR_MODE=$(config_quote "$GITHUB_ACCELERATOR_MODE")
+GITHUB_ACCELERATOR_URL=$(config_quote "$GITHUB_ACCELERATOR_URL")
+EOF
+    fi
+    load_global_config
+}
+
+load_global_config() {
+    if [ -f "$GLOBAL_CONFIG" ]; then
+        # shellcheck disable=SC1090
+        . "$GLOBAL_CONFIG"
+    fi
+    TUNNEL_ENABLE_MODE="${TUNNEL_ENABLE_MODE:-$DEFAULT_TUNNEL_ENABLE_MODE}"
+    TUNNEL_AUTO_START_DELAY="${TUNNEL_AUTO_START_DELAY:-$DEFAULT_AUTOSTART_DELAY}"
+    GITHUB_REPO="${GITHUB_REPO:-Frankzhang854/userspace-vxlan}"
+    RELEASE_VERSION="${RELEASE_VERSION:-latest}"
+    GITHUB_ACCELERATOR_MODE="${GITHUB_ACCELERATOR_MODE:-auto}"
+    GITHUB_ACCELERATOR_URL="${GITHUB_ACCELERATOR_URL:-https://github.521314666.xyz}"
+}
+
+update_global_kv() {
+    key="$1"
+    value="$2"
+    mkdir -p "$(dirname "$GLOBAL_CONFIG")"
+    if grep -q "^${key}=" "$GLOBAL_CONFIG" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=$(config_quote "$value")|" "$GLOBAL_CONFIG"
+    else
+        printf '%s=%s\n' "$key" "$(config_quote "$value")" >>"$GLOBAL_CONFIG"
+    fi
+}
+
+reset_tunnel_defaults() {
+    name="${1:-uvxlan0}"
+    TUNNEL_NAME="$name"
+    ENABLED="true"
+    VNI="100"
+    TAP_IFACE="$(ifname_for tap "$name")"
+    BRIDGE_IFACE=""
+    MANAGE_BRIDGE="0"
+    PHYS_IFACES=""
+    DETACH_PHYS_ON_STOP="0"
+    REMOVE_MANAGED_BRIDGE_ON_STOP="0"
+    VXLAN_PORT="4789"
+    LOCAL_LISTEN="0.0.0.0:4789"
+    PEERS=""
+    MTU="1280"
+    FRAME_SIZE="1600"
+    BINARY_PATH="/usr/local/bin/tapvxlan-udp"
+    PID_FILE="/var/run/userspace-vxlan-${name}.pid"
+    LOG_FILE="/var/log/userspace-vxlan-${name}.log"
+    DOWNLOAD_BASE_URL=""
+    VERIFY_DOWNLOAD="1"
+    DOWNLOAD_TIMEOUT="120"
+    GITHUB_DIRECT_CHECK_TIMEOUT="8"
+    ALLOW_IFACE_WITH_IP="1"
+}
+
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         # shellcheck disable=SC1090
@@ -86,6 +229,17 @@ load_config() {
     GITHUB_ACCELERATOR_URL="${GITHUB_ACCELERATOR_URL:-https://github.521314666.xyz}"
     GITHUB_DIRECT_CHECK_TIMEOUT="${GITHUB_DIRECT_CHECK_TIMEOUT:-8}"
     ALLOW_IFACE_WITH_IP="${ALLOW_IFACE_WITH_IP:-1}"
+    ENABLED="$(normalize_enabled "${ENABLED:-true}")"
+}
+
+load_tunnel_config() {
+    name="$1"
+    validate_tunnel_name "$name" || return 1
+    CONFIG_FILE="$(tunnel_config_file "$name")"
+    reset_tunnel_defaults "$name"
+    load_global_config
+    [ -f "$CONFIG_FILE" ] || return 1
+    load_config
 }
 
 write_default_config() {
@@ -102,6 +256,7 @@ write_default_config() {
 # Target devices do not need Go installed; the binary is downloaded from GitHub Releases.
 
 TUNNEL_NAME="uvxlan0"
+ENABLED="true"
 VNI="100"
 TAP_IFACE="tapvx100"
 
@@ -188,6 +343,7 @@ write_config_from_vars() {
 # Target devices do not need Go installed; the binary is downloaded from GitHub Releases.
 
 TUNNEL_NAME=$(config_quote "$TUNNEL_NAME")
+ENABLED=$(config_quote "$ENABLED")
 VNI=$(config_quote "$VNI")
 TAP_IFACE=$(config_quote "$TAP_IFACE")
 
@@ -903,29 +1059,43 @@ json_escape() {
 }
 
 status_json() {
-    load_config
-    running=false
-    pid=""
-    if is_running; then
-        running=true
-        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    fi
-    ts_ip=""
-    if command_exists tailscale; then
-        ts_ip="$(tailscale ip -4 2>/dev/null | head -n 1)"
-    fi
+    load_global_config
     printf '{'
     printf '"version":"%s",' "$(json_escape "$VERSION")"
-    printf '"running":%s,' "$running"
-    printf '"pid":"%s",' "$(json_escape "$pid")"
-    printf '"tap":"%s",' "$(json_escape "$TAP_IFACE")"
-    printf '"bridge":"%s",' "$(json_escape "$BRIDGE_IFACE")"
-    printf '"vni":"%s",' "$(json_escape "$VNI")"
-    printf '"listen":"%s",' "$(json_escape "$LOCAL_LISTEN")"
-    printf '"peers":"%s",' "$(json_escape "$PEERS")"
-    printf '"tailscale_ip":"%s",' "$(json_escape "$ts_ip")"
-    printf '"binary":"%s",' "$(json_escape "$BINARY_PATH")"
-    printf '"release":"%s"' "$(json_escape "$RELEASE_VERSION")"
+    printf '"config_dir":"%s",' "$(json_escape "$CONFIG_DIR")"
+    printf '"enable_mode":"%s",' "$(json_escape "${TUNNEL_ENABLE_MODE:-$DEFAULT_TUNNEL_ENABLE_MODE}")"
+    printf '"tunnels":['
+    first=1
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        name="$(basename "$conf" .conf)"
+        reset_tunnel_defaults "$name"
+        CONFIG_FILE="$conf"
+        load_config
+        running=false
+        pid=""
+        if is_running; then
+            running=true
+            pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        fi
+        [ "$first" = "0" ] && printf ','
+        first=0
+        printf '{'
+        printf '"name":"%s",' "$(json_escape "$name")"
+        printf '"enabled":%s,' "$(normalize_enabled "$ENABLED")"
+        printf '"running":%s,' "$running"
+        printf '"pid":"%s",' "$(json_escape "$pid")"
+        printf '"tap":"%s",' "$(json_escape "$TAP_IFACE")"
+        printf '"bridge":"%s",' "$(json_escape "$BRIDGE_IFACE")"
+        printf '"phys_ifaces":"%s",' "$(json_escape "$PHYS_IFACES")"
+        printf '"vni":"%s",' "$(json_escape "$VNI")"
+        printf '"listen":"%s",' "$(json_escape "$LOCAL_LISTEN")"
+        printf '"peers":"%s",' "$(json_escape "$PEERS")"
+        printf '"binary":"%s",' "$(json_escape "$BINARY_PATH")"
+        printf '"release":"%s"' "$(json_escape "$RELEASE_VERSION")"
+        printf '}'
+    done
+    printf ']'
     printf '}\n'
 }
 
@@ -961,7 +1131,7 @@ doctor() {
 
 install_systemd_service() {
     need_root
-    load_config
+    ensure_manager_env
     mkdir -p "$(dirname "$SCRIPT_INSTALL_PATH")"
     if [ "$SCRIPT_PATH" != "$SCRIPT_INSTALL_PATH" ]; then
         cp "$SCRIPT_PATH" "$SCRIPT_INSTALL_PATH"
@@ -977,8 +1147,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$SCRIPT_INSTALL_PATH start
-ExecStop=$SCRIPT_INSTALL_PATH stop
+ExecStartPre=/bin/sleep ${TUNNEL_AUTO_START_DELAY:-0}
+ExecStart=$SCRIPT_INSTALL_PATH apply-all
+ExecStop=$SCRIPT_INSTALL_PATH stop-all
 TimeoutStartSec=60
 TimeoutStopSec=30
 
@@ -992,7 +1163,7 @@ EOF
 
 install_initd_service() {
     need_root
-    load_config
+    ensure_manager_env
     mkdir -p "$(dirname "$SCRIPT_INSTALL_PATH")"
     if [ "$SCRIPT_PATH" != "$SCRIPT_INSTALL_PATH" ]; then
         cp "$SCRIPT_PATH" "$SCRIPT_INSTALL_PATH"
@@ -1005,15 +1176,18 @@ START=99
 STOP=10
 
 start() {
-    $SCRIPT_INSTALL_PATH start
+    sleep ${TUNNEL_AUTO_START_DELAY:-0}
+    $SCRIPT_INSTALL_PATH apply-all
 }
 
 stop() {
-    $SCRIPT_INSTALL_PATH stop
+    $SCRIPT_INSTALL_PATH stop-all
 }
 
 restart() {
-    $SCRIPT_INSTALL_PATH restart
+    $SCRIPT_INSTALL_PATH stop-all
+    sleep ${TUNNEL_AUTO_START_DELAY:-0}
+    $SCRIPT_INSTALL_PATH apply-all
 }
 EOF
     chmod +x "$INITD_SERVICE_FILE"
@@ -1050,11 +1224,429 @@ disable_autostart() {
 
 uninstall() {
     need_root
-    stop_tunnel || true
+    stop_all_tunnels || stop_tunnel || true
     disable_autostart || true
     rm -f "$BINARY_PATH"
     ok "Removed binary: $BINARY_PATH"
-    warn "Config kept: $CONFIG_FILE"
+    warn "Configs kept: $CONFIG_DIR and $GLOBAL_CONFIG"
+}
+
+get_ifs() {
+    if ! command_exists ip; then
+        return 0
+    fi
+    ip -br link show | awk 'NF==0{next} $1!~/^(lo|ts|tail|dock|veth|br-|wg|vxlan|tun|tap|ppp)/ && $1!~/\.[0-9]+$/ {print $1}'
+}
+
+get_tailscale_peers() {
+    command_exists tailscale || return 1
+    command_exists jq || return 1
+    tailscale status --json 2>/dev/null | jq -r '.Peer[]? | select(.ExitNode==false) | "\(.HostName):\(.TailscaleIPs[0])"' 2>/dev/null
+}
+
+set_config_enabled_state() {
+    file="$1"
+    state="$(normalize_enabled "$2")"
+    if grep -q '^ENABLED=' "$file" 2>/dev/null; then
+        sed -i "s|^ENABLED=.*|ENABLED=$(config_quote "$state")|" "$file"
+    else
+        printf 'ENABLED=%s\n' "$(config_quote "$state")" >>"$file"
+    fi
+}
+
+tunnel_runtime_pid() {
+    name="$1"
+    file="$(tunnel_config_file "$name")"
+    [ -f "$file" ] || return 1
+    (
+        reset_tunnel_defaults "$name"
+        CONFIG_FILE="$file"
+        load_config
+        if [ -f "$PID_FILE" ]; then
+            pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+            if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+                printf '%s\n' "$pid"
+                exit 0
+            fi
+        fi
+        exit 1
+    )
+}
+
+list_tunnels() {
+    ensure_manager_env
+    echo
+    echo "--- Configured tunnels ---"
+    set -- "$CONFIG_DIR"/*.conf
+    if [ ! -e "$1" ]; then
+        echo "No config."
+        return 0
+    fi
+
+    printf "%-4s %-12s %-8s %-12s %-6s %-16s %-18s %-8s\n" \
+        "No." "Tunnel" "Enabled" "Iface" "VNI" "Listen" "Peers" "Runtime"
+
+    idx=1
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        name="$(basename "$conf" .conf)"
+        (
+            reset_tunnel_defaults "$name"
+            CONFIG_FILE="$conf"
+            load_config
+            iface="${PHYS_IFACES:-${BRIDGE_IFACE:-standalone}}"
+            peers_short="${PEERS:-<empty>}"
+            [ ${#peers_short} -gt 18 ] && peers_short="$(printf '%s' "$peers_short" | cut -c1-15)..."
+            if tunnel_runtime_pid "$name" >/dev/null 2>&1; then
+                runtime="running"
+            else
+                runtime="stopped"
+            fi
+            printf "%-4s %-12s %-8s %-12s %-6s %-16s %-18s %-8s\n" \
+                "$idx)" "$name" "$(normalize_enabled "$ENABLED")" "$iface" "$VNI" "$LOCAL_LISTEN" "$peers_short" "$runtime"
+        )
+        idx=$((idx + 1))
+    done
+}
+
+choose_tunnel_name() {
+    list_tunnels
+    name="$(prompt_tunnel_name "Tunnel name: ")"
+    if [ ! -f "$(tunnel_config_file "$name")" ]; then
+        err "Tunnel config not found: $name"
+        return 1
+    fi
+    SELECTED_TUNNEL="$name"
+}
+
+prompt_tunnel_index_selection() {
+    prompt="${1:-Tunnel index(es), comma separated: }"
+    names=""
+    idx=1
+    list_tunnels >&2
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        name="$(basename "$conf" .conf)"
+        names="${names}${idx}:${name} "
+        idx=$((idx + 1))
+    done
+    [ -n "$names" ] || return 1
+    printf "%s" "$prompt" >&2
+    read -r input
+    selected=""
+    for item in $(printf '%s\n' "$input" | tr ',' ' '); do
+        case "$item" in
+            ''|*[!0-9]*)
+                err "Invalid tunnel index: $item"
+                return 1
+                ;;
+        esac
+        found=""
+        for pair in $names; do
+            nidx="${pair%%:*}"
+            nname="${pair#*:}"
+            if [ "$nidx" = "$item" ]; then
+                found="$nname"
+                break
+            fi
+        done
+        [ -n "$found" ] || { err "Invalid tunnel index: $item"; return 1; }
+        if [ -z "$selected" ]; then
+            selected="$found"
+        else
+            selected="${selected},${found}"
+        fi
+    done
+    [ -n "$selected" ] || { err "No tunnel selected"; return 1; }
+    printf '%s\n' "$selected"
+}
+
+first_phys_iface_for_tunnel() {
+    file="$1"
+    (
+        # shellcheck disable=SC1090
+        . "$file"
+        set -- $(iface_list "${PHYS_IFACES:-}")
+        printf '%s\n' "${1:-${BRIDGE_IFACE:-}}"
+    )
+}
+
+disable_conflicting_tunnels() {
+    target="$1"
+    target_file="$(tunnel_config_file "$target")"
+    mode="${TUNNEL_ENABLE_MODE:-$DEFAULT_TUNNEL_ENABLE_MODE}"
+    target_iface="$(first_phys_iface_for_tunnel "$target_file")"
+    [ "$mode" = "free" ] && return 0
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        name="$(basename "$conf" .conf)"
+        [ "$name" = "$target" ] && continue
+        other_iface="$(first_phys_iface_for_tunnel "$conf")"
+        if [ "$mode" = "single" ] || { [ "$mode" = "exclusive-by-iface" ] && [ -n "$target_iface" ] && [ "$target_iface" = "$other_iface" ]; }; then
+            set_config_enabled_state "$conf" "false"
+            stop_tunnel_by_name "$name" >/dev/null 2>&1 || true
+            echo "Auto disabled conflicting tunnel [$name]."
+        fi
+    done
+}
+
+enable_tunnel_config() {
+    name="$1"
+    validate_tunnel_name "$name" || { err "Invalid tunnel name"; return 1; }
+    file="$(tunnel_config_file "$name")"
+    [ -f "$file" ] || { err "Tunnel config not found: $name"; return 1; }
+    load_global_config
+    disable_conflicting_tunnels "$name" || return 1
+    set_config_enabled_state "$file" "true"
+    ok "Tunnel [$name] enabled."
+}
+
+disable_tunnel_config() {
+    name="$1"
+    validate_tunnel_name "$name" || { err "Invalid tunnel name"; return 1; }
+    file="$(tunnel_config_file "$name")"
+    [ -f "$file" ] || { err "Tunnel config not found: $name"; return 1; }
+    set_config_enabled_state "$file" "false"
+    stop_tunnel_by_name "$name" || true
+    ok "Tunnel [$name] disabled."
+}
+
+start_tunnel_by_name() {
+    name="$1"
+    load_tunnel_config "$name" || { err "Tunnel config not found: $name"; return 1; }
+    start_tunnel
+}
+
+stop_tunnel_by_name() {
+    name="$1"
+    load_tunnel_config "$name" || { err "Tunnel config not found: $name"; return 1; }
+    stop_tunnel
+}
+
+sync_apply_all() {
+    ensure_manager_env
+    rc=0
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        name="$(basename "$conf" .conf)"
+        load_tunnel_config "$name" || { rc=1; continue; }
+        if [ "$(normalize_enabled "$ENABLED")" = "true" ]; then
+            echo "Applying tunnel [$name]..."
+            start_tunnel || rc=1
+        else
+            stop_tunnel || true
+        fi
+    done
+    return "$rc"
+}
+
+stop_all_tunnels() {
+    ensure_manager_env
+    for conf in "$CONFIG_DIR"/*.conf; do
+        [ -e "$conf" ] || continue
+        name="$(basename "$conf" .conf)"
+        stop_tunnel_by_name "$name" || true
+    done
+}
+
+save_config_logic() {
+    name="$1"
+    validate_tunnel_name "$name" || { err "Invalid tunnel name"; return 1; }
+    ensure_manager_env
+    file="$(tunnel_config_file "$name")"
+    is_existing="false"
+    if [ -f "$file" ]; then
+        is_existing="true"
+        load_tunnel_config "$name" || reset_tunnel_defaults "$name"
+    else
+        reset_tunnel_defaults "$name"
+        CONFIG_FILE="$file"
+    fi
+
+    echo
+    echo "Configure tunnel [$name]"
+    read_value "Tunnel name" "$name" TUNNEL_NAME
+    if [ "$TUNNEL_NAME" != "$name" ]; then
+        validate_tunnel_name "$TUNNEL_NAME" || { err "Invalid tunnel name"; return 1; }
+        name="$TUNNEL_NAME"
+        file="$(tunnel_config_file "$name")"
+        CONFIG_FILE="$file"
+    fi
+
+    mapfile -t ifs < <(get_ifs)
+    echo "Choose physical/member interface:"
+    echo "0) Standalone TAP only"
+    idx=1
+    for iface in "${ifs[@]}"; do
+        echo "$idx) $iface"
+        idx=$((idx + 1))
+    done
+    max_idx="${#ifs[@]}"
+    iface_idx="$(prompt_number_range "Index: " "0" 0 "$max_idx")"
+    if [ "$iface_idx" = "0" ]; then
+        BRIDGE_IFACE=""
+        PHYS_IFACES=""
+        MANAGE_BRIDGE="0"
+    else
+        chosen_iface="${ifs[$((iface_idx - 1))]}"
+        BRIDGE_IFACE="$(ifname_for br- "$name")"
+        PHYS_IFACES="$chosen_iface"
+        MANAGE_BRIDGE="1"
+        warn "Adding $chosen_iface to a bridge can interrupt remote access."
+        if ask_yes_no "Allow adding interfaces that already have IP addresses?" "y"; then
+            ALLOW_IFACE_WITH_IP="1"
+        else
+            ALLOW_IFACE_WITH_IP="0"
+        fi
+    fi
+
+    read_value "Bridge interface" "$BRIDGE_IFACE" BRIDGE_IFACE
+    read_value "TAP interface name" "${TAP_IFACE:-$(ifname_for tap "$name")}" TAP_IFACE
+    VNI="$(prompt_number_range "VNI (default ${VNI:-100}): " "${VNI:-100}" 1 16777215)"
+    local_port="$(printf '%s' "${LOCAL_LISTEN##*:}")"
+    local_port="$(prompt_number_range "Local UDP port (default ${local_port:-4789}): " "${local_port:-4789}" 1 65535)"
+    LOCAL_LISTEN="0.0.0.0:${local_port}"
+
+    echo "Reading Tailscale peers..."
+    mapfile -t ts_peers < <(get_tailscale_peers || true)
+    if [ "${#ts_peers[@]}" -gt 0 ]; then
+        idx=1
+        for peer in "${ts_peers[@]}"; do
+            host="${peer%%:*}"
+            ip="${peer#*:}"
+            printf "%2d) %-20s [%s]\n" "$idx" "$host" "$ip"
+            idx=$((idx + 1))
+        done
+        printf "Peer indexes, comma separated (empty for manual): "
+        read -r peer_indexes
+        if [ -n "$peer_indexes" ]; then
+            echo "Peer mode:"
+            echo "1) IP(static)"
+            echo "2) Hostname(dynamic)"
+            peer_mode="$(prompt_number_range "Choose [1-2]: " "1" 1 2)"
+            peer_port="$(prompt_number_range "Peer UDP port (default ${VXLAN_PORT:-4789}): " "${VXLAN_PORT:-4789}" 1 65535)"
+            PEERS=""
+            for item in $(printf '%s\n' "$peer_indexes" | tr ',' ' '); do
+                number_in_range "$item" 1 "${#ts_peers[@]}" || { err "Invalid peer index: $item"; return 1; }
+                peer="${ts_peers[$((item - 1))]}"
+                host="${peer%%:*}"
+                ip="${peer#*:}"
+                if [ "$peer_mode" = "2" ]; then
+                    endpoint="${host}:${peer_port}"
+                else
+                    endpoint="${ip}:${peer_port}"
+                fi
+                if [ -z "$PEERS" ]; then
+                    PEERS="$endpoint"
+                else
+                    PEERS="${PEERS},${endpoint}"
+                fi
+            done
+        else
+            read_value "Peer list, comma-separated host:port" "$PEERS" PEERS
+        fi
+    else
+        warn "Could not read Tailscale peers automatically. Enter peers manually."
+        read_value "Peer list, comma-separated host:port" "$PEERS" PEERS
+    fi
+
+    MTU="$(prompt_number_range "TAP MTU (default ${MTU:-1280}): " "${MTU:-1280}" 576 9000)"
+    FRAME_SIZE="$(prompt_number_range "Frame buffer size (default ${FRAME_SIZE:-1600}): " "${FRAME_SIZE:-1600}" 576 65535)"
+    read_value "Binary path" "${BINARY_PATH:-/usr/local/bin/tapvxlan-udp}" BINARY_PATH
+    read_value "Release version for binary download" "${RELEASE_VERSION:-latest}" RELEASE_VERSION
+    read_value "GitHub accelerator mode (auto/always/never)" "${GITHUB_ACCELERATOR_MODE:-auto}" GITHUB_ACCELERATOR_MODE
+
+    PID_FILE="/var/run/userspace-vxlan-${name}.pid"
+    LOG_FILE="/var/log/userspace-vxlan-${name}.log"
+    VXLAN_PORT="$local_port"
+    if [ "$is_existing" = "false" ]; then
+        if ask_yes_no "Activate and switch to this tunnel now?" "y"; then
+            ENABLED="true"
+        else
+            ENABLED="false"
+        fi
+    fi
+
+    CONFIG_FILE="$file"
+    write_config_from_vars
+    ok "Tunnel [$name] saved."
+    if [ "$ENABLED" = "true" ]; then
+        enable_tunnel_config "$name" && sync_apply_all
+    else
+        echo "Tunnel [$name] saved as disabled. Use Enable/Switch tunnels when needed."
+    fi
+}
+
+delete_tunnel_config() {
+    if [ -n "${1:-}" ]; then
+        SELECTED_TUNNEL="$1"
+    else
+        choose_tunnel_name || return 1
+    fi
+    validate_tunnel_name "$SELECTED_TUNNEL" || return 1
+    file="$(tunnel_config_file "$SELECTED_TUNNEL")"
+    [ -f "$file" ] || { err "Tunnel config not found."; return 1; }
+    stop_tunnel_by_name "$SELECTED_TUNNEL" || true
+    rm -f "$file"
+    ok "Tunnel [$SELECTED_TUNNEL] deleted."
+}
+
+manage_tunnel_enable_menu() {
+    while true; do
+        load_global_config
+        list_tunnels
+        echo
+        echo "Enable mode: ${TUNNEL_ENABLE_MODE:-$DEFAULT_TUNNEL_ENABLE_MODE}"
+        echo "1) Enable/Switch selected tunnel(s)"
+        echo "2) Disable selected tunnel(s)"
+        echo "3) Enable only selected tunnel(s)"
+        echo "4) Set enable mode"
+        echo "0) Back"
+        printf "Menu: "
+        read -r opt
+        case "$opt" in
+            1)
+                names="$(prompt_tunnel_index_selection "Tunnel index(es) to enable/switch, comma separated: ")" || continue
+                for n in $(printf '%s\n' "$names" | tr ',' ' '); do
+                    enable_tunnel_config "$n" || break
+                done
+                sync_apply_all
+                ;;
+            2)
+                names="$(prompt_tunnel_index_selection "Tunnel index(es) to disable, comma separated: ")" || continue
+                for n in $(printf '%s\n' "$names" | tr ',' ' '); do
+                    disable_tunnel_config "$n" || break
+                done
+                ;;
+            3)
+                names="$(prompt_tunnel_index_selection "Tunnel index(es) to keep enabled, comma separated: ")" || continue
+                for conf in "$CONFIG_DIR"/*.conf; do
+                    [ -e "$conf" ] || continue
+                    n="$(basename "$conf" .conf)"
+                    case ",$names," in
+                        *",$n,"*) set_config_enabled_state "$conf" "true" ;;
+                        *) set_config_enabled_state "$conf" "false"; stop_tunnel_by_name "$n" >/dev/null 2>&1 || true ;;
+                    esac
+                done
+                sync_apply_all
+                ;;
+            4)
+                echo "Tunnel enable modes:"
+                echo "1) exclusive-by-iface"
+                echo "2) single"
+                echo "3) free"
+                mode_idx="$(prompt_number_range "Choose [1-3]: " "1" 1 3)"
+                case "$mode_idx" in
+                    1) mode="exclusive-by-iface" ;;
+                    2) mode="single" ;;
+                    3) mode="free" ;;
+                esac
+                update_global_kv "TUNNEL_ENABLE_MODE" "$mode"
+                ok "Tunnel enable mode set to: $mode"
+                ;;
+            0) return 0 ;;
+        esac
+    done
 }
 
 edit_config_hint() {
@@ -1073,46 +1665,86 @@ edit_config_hint() {
     echo "  GITHUB_ACCELERATOR_MODE=\"auto\""
 }
 
+show_menu() {
+    load_global_config
+    echo
+    echo "========================================================"
+    echo "    User-space VXLAN over Tailscale Manager v$VERSION"
+    echo "    Flow: TAP <-> user-space VXLAN UDP <-> underlay"
+    echo "    Config dir: $CONFIG_DIR"
+    echo "    Tunnel autostart: $([ -f "$SYSTEMD_SERVICE_FILE" ] || [ -f "$INITD_SERVICE_FILE" ] && echo enabled || echo disabled)"
+    echo "    Tunnel autostart delay: ${TUNNEL_AUTO_START_DELAY:-$DEFAULT_AUTOSTART_DELAY}s"
+    echo "    Tunnel enable mode: ${TUNNEL_ENABLE_MODE:-$DEFAULT_TUNNEL_ENABLE_MODE}"
+    echo "    GitHub accelerator: ${GITHUB_ACCELERATOR_MODE:-auto}"
+    echo "========================================================"
+}
+
 menu() {
+    ensure_manager_env
     while true; do
-        echo
-        echo "User-space VXLAN over Tailscale control ($VERSION)"
-        echo "1) New tunnel wizard"
-        echo "2) View tunnel summary"
-        echo "3) Init default config"
-        echo "4) Show config/status"
-        echo "5) Doctor/check environment"
-        echo "6) Install binary from GitHub Release"
-        echo "7) Update binary from GitHub Release"
-        echo "8) Start tunnel"
-        echo "9) Stop tunnel"
-        echo "10) Restart tunnel"
-        echo "11) Show logs"
-        echo "12) Enable autostart"
-        echo "13) Disable autostart"
-        echo "14) Update this script from Release"
-        echo "15) Status JSON"
-        echo "16) Config edit hint"
+        show_menu
+        echo "1) Create tunnel"
+        echo "2) Modify tunnel"
+        echo "3) Show tunnel details"
+        echo "4) Delete tunnel"
+        echo "5) Apply all"
+        echo "6) Set manual MTU"
+        echo "7) Enable tunnel autostart"
+        echo "8) Disable tunnel autostart"
+        echo "9) Set tunnel autostart delay"
+        echo "10) Show manager status"
+        echo "11) Uninstall manager and helper"
+        echo "12) View log"
+        echo "13) Enable/Switch tunnels"
         echo "0) Exit"
-        printf "Select: "
+        printf "Menu: "
         read -r choice
         case "$choice" in
-            1) create_tunnel_wizard ;;
-            2) view_tunnel ;;
-            3) write_default_config ;;
-            4) status_tunnel ;;
-            5) doctor ;;
-            6) install_binary ;;
-            7) update_binary ;;
-            8) start_tunnel ;;
-            9) stop_tunnel ;;
-            10) restart_tunnel ;;
-            11) show_logs ;;
-            12) enable_autostart ;;
-            13) disable_autostart ;;
-            14) update_script ;;
-            15) status_json ;;
-            16) edit_config_hint ;;
+            1)
+                n="$(prompt_tunnel_name "Tunnel name: ")"
+                save_config_logic "$n"
+                ;;
+            2)
+                list_tunnels
+                n="$(prompt_tunnel_name "Tunnel name to modify: ")"
+                if [ -f "$(tunnel_config_file "$n")" ]; then
+                    save_config_logic "$n"
+                else
+                    warn "Tunnel config not found."
+                fi
+                ;;
+            3) list_tunnels ;;
+            4) delete_tunnel_config ;;
+            5) sync_apply_all ;;
+            6)
+                choose_tunnel_name || continue
+                load_tunnel_config "$SELECTED_TUNNEL" || continue
+                MTU="$(prompt_number_range "TAP MTU (default $MTU): " "$MTU" 576 9000)"
+                FRAME_SIZE="$(prompt_number_range "Frame buffer size (default $FRAME_SIZE): " "$FRAME_SIZE" 576 65535)"
+                write_config_from_vars
+                [ -d "/sys/class/net/$TAP_IFACE" ] && ip link set dev "$TAP_IFACE" mtu "$MTU" >/dev/null 2>&1 || true
+                ok "Tunnel [$SELECTED_TUNNEL] MTU updated."
+                ;;
+            7) enable_autostart ;;
+            8) disable_autostart ;;
+            9)
+                delay="$(prompt_number_range "Autostart delay seconds (default ${TUNNEL_AUTO_START_DELAY:-0}): " "${TUNNEL_AUTO_START_DELAY:-0}" 0 3600)"
+                update_global_kv "TUNNEL_AUTO_START_DELAY" "$delay"
+                ok "Tunnel autostart delay set to ${delay}s"
+                ;;
+            10)
+                show_menu
+                list_tunnels
+                ;;
+            11) uninstall ;;
+            12)
+                if [ -f "$LOG_FILE_GLOBAL" ]; then
+                    tail -n 80 "$LOG_FILE_GLOBAL"
+                else
+                    warn "No manager log file: $LOG_FILE_GLOBAL"
+                fi
+                ;;
+            13) manage_tunnel_enable_menu ;;
             0) exit 0 ;;
             *) warn "Unknown choice" ;;
         esac
@@ -1124,9 +1756,17 @@ usage() {
 Usage: $0 COMMAND
 
 Commands:
+  create NAME       Create or modify one named tunnel
+  modify NAME       Alias of create
+  list              Show configured tunnels
+  apply-all         Apply/start all enabled tunnels
+  stop-all          Stop all configured tunnels
+  enable NAME       Enable/switch one tunnel and apply enabled tunnels
+  disable NAME      Disable one tunnel and stop its runtime
+  delete NAME       Delete one tunnel config and stop its runtime
   new-tunnel        Interactive wizard: create config, install binary, start
   create-tunnel     Alias of new-tunnel
-  view-tunnel       Show concise tunnel summary
+  view-tunnel       Show concise tunnel summary for legacy single config
   init-config       Create default config at $CONFIG_FILE
   config            Show loaded config
   check             Check TAP/Tailscale/bridge environment
@@ -1156,7 +1796,14 @@ EOF
 main() {
     cmd="${1:-menu}"
     case "$cmd" in
-        new-tunnel|create-tunnel) create_tunnel_wizard ;;
+        create|modify) save_config_logic "${2:-$(prompt_tunnel_name "Tunnel name: ")}" ;;
+        list|show-tunnels|list-tunnels) list_tunnels ;;
+        apply-all) sync_apply_all ;;
+        stop-all) stop_all_tunnels ;;
+        enable) enable_tunnel_config "${2:-}" && sync_apply_all ;;
+        disable) disable_tunnel_config "${2:-}" ;;
+        delete) delete_tunnel_config "${2:-}" ;;
+        new-tunnel|create-tunnel) save_config_logic "$(prompt_tunnel_name "Tunnel name: ")" ;;
         view-tunnel|show-tunnel) view_tunnel ;;
         init-config) write_default_config ;;
         config) show_config ;;
