@@ -76,13 +76,14 @@ binaries when a version tag is pushed.
 Create and push a tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The workflow publishes these release assets:
 
 ```text
+userspace-vxlan-tailscale.sh
 tapvxlan-udp-linux-amd64
 tapvxlan-udp-linux-386
 tapvxlan-udp-linux-arm64
@@ -102,18 +103,20 @@ to `BINARY_PATH`, usually `/usr/local/bin/tapvxlan-udp`.
 The control script can download release binaries automatically:
 
 ```bash
-DOWNLOAD_BINARY="1"
 GITHUB_REPO="Frankzhang854/userspace-vxlan"
-RELEASE_VERSION="v0.1.0"
+RELEASE_VERSION="v0.2.0"
 BINARY_PATH="/usr/local/bin/tapvxlan-udp"
-AUTO_BUILD="0"
+VERIFY_DOWNLOAD="1"
 ```
 
 Then run:
 
 ```bash
-sudo ./userspace-vxlan-tailscale.sh build
+sudo ./userspace-vxlan-tailscale.sh install-binary
 ```
 
 The script maps `uname -m` to the matching release asset and verifies it with
 `checksums.txt` when `sha256sum` is available.
+
+`build` is kept as a compatibility alias for `install-binary`; it does not
+compile Go on the target device. Go is only needed in GitHub Actions.

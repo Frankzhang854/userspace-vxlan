@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -u
 
-VERSION="0.1.0-userspace"
+VERSION="0.2.0-userspace"
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR"
 
 CONFIG_FILE="${VXLAN_TS_CONFIG:-/etc/userspace-vxlan-tailscale.conf}"
+SERVICE_NAME="userspace-vxlan-tailscale"
+SYSTEMD_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+INITD_SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
+SCRIPT_INSTALL_PATH="/usr/local/sbin/userspace-vxlan-tailscale.sh"
 
 TUNNEL_NAME="uvxlan0"
 VNI="100"
@@ -25,19 +28,18 @@ FRAME_SIZE="1600"
 BINARY_PATH="/usr/local/bin/tapvxlan-udp"
 PID_FILE="/var/run/userspace-vxlan-tailscale.pid"
 LOG_FILE="/var/log/userspace-vxlan-tailscale.log"
-DOWNLOAD_BINARY="0"
 GITHUB_REPO="Frankzhang854/userspace-vxlan"
 RELEASE_VERSION="latest"
 DOWNLOAD_BASE_URL=""
 VERIFY_DOWNLOAD="1"
-AUTO_BUILD="1"
-GOPROXY_VALUE="${GOPROXY:-https://goproxy.cn,direct}"
+DOWNLOAD_TIMEOUT="120"
+ALLOW_IFACE_WITH_IP="1"
 
-RED=''
-GREEN=''
-YELLOW=''
-BLUE=''
-NC=''
+RED=""
+GREEN=""
+YELLOW=""
+BLUE=""
+NC=""
 if [ -t 1 ]; then
     RED="$(printf '\033[31m')"
     GREEN="$(printf '\033[32m')"
@@ -58,6 +60,10 @@ need_root() {
     fi
 }
 
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         # shellcheck disable=SC1090
@@ -68,11 +74,12 @@ load_config() {
     PHYS_IFACES="${PHYS_IFACES:-}"
     DETACH_PHYS_ON_STOP="${DETACH_PHYS_ON_STOP:-0}"
     REMOVE_MANAGED_BRIDGE_ON_STOP="${REMOVE_MANAGED_BRIDGE_ON_STOP:-0}"
-    DOWNLOAD_BINARY="${DOWNLOAD_BINARY:-0}"
-    GITHUB_REPO="${GITHUB_REPO:-}"
+    GITHUB_REPO="${GITHUB_REPO:-Frankzhang854/userspace-vxlan}"
     RELEASE_VERSION="${RELEASE_VERSION:-latest}"
     DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL:-}"
     VERIFY_DOWNLOAD="${VERIFY_DOWNLOAD:-1}"
+    DOWNLOAD_TIMEOUT="${DOWNLOAD_TIMEOUT:-120}"
+    ALLOW_IFACE_WITH_IP="${ALLOW_IFACE_WITH_IP:-1}"
 }
 
 write_default_config() {
@@ -81,27 +88,29 @@ write_default_config() {
         warn "Config already exists: $CONFIG_FILE"
         return 0
     fi
+
+    mkdir -p "$(dirname "$CONFIG_FILE")"
     cat >"$CONFIG_FILE" <<EOF
 # User-space VXLAN over Tailscale/underlay config
 # This backend does not require the kernel vxlan module.
+# Target devices do not need Go installed; the binary is downloaded from GitHub Releases.
 
 TUNNEL_NAME="uvxlan0"
 VNI="100"
 TAP_IFACE="tapvx100"
 
-# Optional. Set to br-lan or another Linux bridge to join the remote/local LAN.
-# Leave empty for standalone testing.
+# Set to br-lan, br0, or another bridge to join a LAN.
+# Leave empty for standalone TAP testing.
 BRIDGE_IFACE=""
 
-# Optional bridge management.
-# MANAGE_BRIDGE=1 lets this script create BRIDGE_IFACE when it does not exist.
-# PHYS_IFACES is a comma/space-separated list of physical ports to add to it.
-# Be careful: moving a management/uplink port into a bridge can interrupt access.
+# MANAGE_BRIDGE=1 creates BRIDGE_IFACE when missing.
+# PHYS_IFACES is a comma/space-separated list of physical/member ports to add.
+# Moving a management/uplink port into a bridge can interrupt remote access.
 MANAGE_BRIDGE="0"
 PHYS_IFACES=""
+ALLOW_IFACE_WITH_IP="1"
 
-# Test cleanup options. Keep disabled on real devices unless you know the bridge
-# is dedicated to this tunnel.
+# Cleanup options. Keep disabled on real devices unless this bridge is dedicated.
 DETACH_PHYS_ON_STOP="0"
 REMOVE_MANAGED_BRIDGE_ON_STOP="0"
 
@@ -109,8 +118,7 @@ VXLAN_PORT="4789"
 LOCAL_LISTEN="0.0.0.0:4789"
 
 # Comma-separated peer underlay addresses.
-# For Tailscale, use peer Tailscale IPs or MagicDNS names, for example:
-# PEERS="100.64.0.2:4789,peer-b.tailnet.ts.net:4789"
+# For Tailscale, use peer Tailscale IPs or MagicDNS names.
 PEERS=""
 
 MTU="1280"
@@ -120,17 +128,12 @@ BINARY_PATH="/usr/local/bin/tapvxlan-udp"
 PID_FILE="/var/run/userspace-vxlan-tailscale.pid"
 LOG_FILE="/var/log/userspace-vxlan-tailscale.log"
 
-# Download a prebuilt binary from GitHub Releases when BINARY_PATH is missing.
-# Set DOWNLOAD_BINARY=1 to install from GitHub Releases.
-DOWNLOAD_BINARY="0"
+# GitHub Release download settings.
 GITHUB_REPO="Frankzhang854/userspace-vxlan"
 RELEASE_VERSION="latest"
 DOWNLOAD_BASE_URL=""
 VERIFY_DOWNLOAD="1"
-
-# Build cmd/tapvxlan-udp from this project if BINARY_PATH is missing.
-AUTO_BUILD="1"
-GOPROXY_VALUE="https://goproxy.cn,direct"
+DOWNLOAD_TIMEOUT="120"
 EOF
     ok "Created config: $CONFIG_FILE"
 }
@@ -140,7 +143,7 @@ show_config() {
     cat <<EOF
 Version:       $VERSION
 Config:        $CONFIG_FILE
-Project dir:   $PROJECT_DIR
+Script path:   $SCRIPT_PATH
 Tunnel name:   $TUNNEL_NAME
 VNI:           $VNI
 TAP iface:     $TAP_IFACE
@@ -154,15 +157,11 @@ Frame size:    $FRAME_SIZE
 Binary:        $BINARY_PATH
 PID file:      $PID_FILE
 Log file:      $LOG_FILE
-Download bin:  $DOWNLOAD_BINARY
-GitHub repo:   ${GITHUB_REPO:-<none>}
+GitHub repo:   $GITHUB_REPO
 Release:       $RELEASE_VERSION
-Auto build:    $AUTO_BUILD
+Verify dl:     $VERIFY_DOWNLOAD
+Dl timeout:    $DOWNLOAD_TIMEOUT
 EOF
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
 }
 
 iface_list() {
@@ -172,33 +171,17 @@ iface_list() {
 detect_binary_asset() {
     arch="$(uname -m)"
     case "$arch" in
-        x86_64|amd64)
-            echo "tapvxlan-udp-linux-amd64"
-            ;;
-        i386|i486|i586|i686)
-            echo "tapvxlan-udp-linux-386"
-            ;;
-        aarch64|arm64)
-            echo "tapvxlan-udp-linux-arm64"
-            ;;
-        armv7l|armv7*)
-            echo "tapvxlan-udp-linux-armv7"
-            ;;
-        armv6l|armv6*)
-            echo "tapvxlan-udp-linux-armv6"
-            ;;
+        x86_64|amd64) echo "tapvxlan-udp-linux-amd64" ;;
+        i386|i486|i586|i686) echo "tapvxlan-udp-linux-386" ;;
+        aarch64|arm64) echo "tapvxlan-udp-linux-arm64" ;;
+        armv7l|armv7*) echo "tapvxlan-udp-linux-armv7" ;;
+        armv6l|armv6*) echo "tapvxlan-udp-linux-armv6" ;;
+        mipsel|mipsle) echo "tapvxlan-udp-linux-mipsle" ;;
+        mips) echo "tapvxlan-udp-linux-mips" ;;
+        riscv64) echo "tapvxlan-udp-linux-riscv64" ;;
         mips64*)
             err "mips64 is not included in the current release matrix"
             return 1
-            ;;
-        mipsel|mipsle)
-            echo "tapvxlan-udp-linux-mipsle"
-            ;;
-        mips)
-            echo "tapvxlan-udp-linux-mips"
-            ;;
-        riscv64)
-            echo "tapvxlan-udp-linux-riscv64"
             ;;
         *)
             err "Unsupported architecture: $arch"
@@ -211,11 +194,11 @@ download_file() {
     url="$1"
     dest="$2"
     if command_exists curl; then
-        curl -fL "$url" -o "$dest"
+        curl -fL --connect-timeout 15 --max-time "$DOWNLOAD_TIMEOUT" --retry 2 --retry-delay 1 "$url" -o "$dest"
     elif command_exists wget; then
-        wget -O "$dest" "$url"
+        wget -T "$DOWNLOAD_TIMEOUT" -O "$dest" "$url"
     else
-        err "curl or wget is required to download release binaries"
+        err "curl or wget is required"
         return 1
     fi
 }
@@ -236,6 +219,23 @@ release_base_url() {
     fi
 }
 
+install_binary() {
+    need_root
+    load_config
+    if [ -x "$BINARY_PATH" ]; then
+        ok "Binary already exists: $BINARY_PATH"
+        return 0
+    fi
+    download_binary
+}
+
+update_binary() {
+    need_root
+    load_config
+    rm -f "$BINARY_PATH"
+    download_binary
+}
+
 download_binary() {
     asset="$(detect_binary_asset)" || return 1
     base_url="$(release_base_url)" || return 1
@@ -251,22 +251,21 @@ download_binary() {
 
     if [ "$VERIFY_DOWNLOAD" = "1" ]; then
         if command_exists sha256sum; then
-            if download_file "$base_url/checksums.txt" "$tmp_checksums"; then
-                (
-                    cd "$tmp_dir" &&
-                    grep "  $asset\$" checksums.txt > checksums.one &&
-                    sha256sum -c checksums.one
-                ) || {
-                    rm -rf "$tmp_dir"
-                    err "Checksum verification failed for $asset"
-                    return 1
-                }
-                ok "Checksum verified"
-            else
+            info "Downloading checksums.txt"
+            download_file "$base_url/checksums.txt" "$tmp_checksums" || {
                 rm -rf "$tmp_dir"
-                err "Failed to download checksums.txt"
                 return 1
-            fi
+            }
+            (
+                cd "$tmp_dir" &&
+                grep "  $asset\$" checksums.txt > checksums.one &&
+                sha256sum -c checksums.one
+            ) || {
+                rm -rf "$tmp_dir"
+                err "Checksum verification failed for $asset"
+                return 1
+            }
+            ok "Checksum verified"
         else
             warn "sha256sum not found; skipping checksum verification"
         fi
@@ -277,6 +276,32 @@ download_binary() {
     chmod +x "$BINARY_PATH"
     rm -rf "$tmp_dir"
     ok "Installed binary: $BINARY_PATH"
+}
+
+update_script() {
+    need_root
+    load_config
+    base_url="$(release_base_url)" || return 1
+    tmp_file="$(mktemp)"
+    info "Downloading userspace-vxlan-tailscale.sh from $base_url"
+    download_file "$base_url/userspace-vxlan-tailscale.sh" "$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+    chmod +x "$tmp_file"
+    mkdir -p "$(dirname "$SCRIPT_INSTALL_PATH")"
+    cp "$tmp_file" "$SCRIPT_INSTALL_PATH"
+    rm -f "$tmp_file"
+    ok "Installed script: $SCRIPT_INSTALL_PATH"
+}
+
+ensure_binary() {
+    load_config
+    if [ -x "$BINARY_PATH" ]; then
+        return 0
+    fi
+    warn "Binary missing: $BINARY_PATH"
+    download_binary
 }
 
 check_tailscale() {
@@ -304,6 +329,13 @@ check_env() {
     check_tap_support || return 1
     command_exists ip || { err "ip command not found"; return 1; }
     check_tailscale
+
+    if [ -x "$BINARY_PATH" ]; then
+        ok "Binary exists: $BINARY_PATH"
+    else
+        warn "Binary missing and will be downloaded: $BINARY_PATH"
+    fi
+
     if [ -n "$BRIDGE_IFACE" ]; then
         if ip link show "$BRIDGE_IFACE" >/dev/null 2>&1; then
             ok "Bridge exists: $BRIDGE_IFACE"
@@ -313,11 +345,18 @@ check_env() {
             err "Bridge not found: $BRIDGE_IFACE"
             return 1
         fi
+
         for iface in $(iface_list "$PHYS_IFACES"); do
             if ip link show "$iface" >/dev/null 2>&1; then
                 ok "Physical/member iface exists: $iface"
                 if ip addr show dev "$iface" | grep -Eq 'inet |inet6 '; then
-                    warn "$iface has IP addresses. Adding it to a bridge without IP migration can interrupt network access."
+                    msg="$iface has IP addresses. Adding it to a bridge can interrupt network access."
+                    if [ "$ALLOW_IFACE_WITH_IP" = "1" ]; then
+                        warn "$msg"
+                    else
+                        err "$msg Set ALLOW_IFACE_WITH_IP=1 to allow."
+                        return 1
+                    fi
                 fi
             else
                 err "Physical/member iface not found: $iface"
@@ -327,46 +366,17 @@ check_env() {
     else
         warn "BRIDGE_IFACE is empty. TAP will not be attached to a LAN bridge."
     fi
+
     if [ -z "$PEERS" ]; then
         warn "PEERS is empty. The program can listen, but cannot flood frames to remote nodes."
     fi
-}
 
-build_binary() {
-    load_config
-    if [ -x "$BINARY_PATH" ]; then
-        ok "Binary already exists: $BINARY_PATH"
-        return 0
-    fi
-    if [ "$DOWNLOAD_BINARY" = "1" ]; then
-        if download_binary; then
-            return 0
+    if command_exists ss; then
+        port="${LOCAL_LISTEN##*:}"
+        if ss -lun 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}\$"; then
+            warn "UDP port appears in use: $port"
         fi
-        if [ "$AUTO_BUILD" != "1" ]; then
-            return 1
-        fi
-        warn "Download failed; falling back to local build"
     fi
-    if [ "$AUTO_BUILD" != "1" ]; then
-        err "Binary missing and AUTO_BUILD is disabled: $BINARY_PATH"
-        return 1
-    fi
-    if ! command_exists go; then
-        err "go command not found. Install Go or place tapvxlan-udp at $BINARY_PATH."
-        return 1
-    fi
-    if [ ! -d "$PROJECT_DIR/cmd/tapvxlan-udp" ]; then
-        err "Project source not found: $PROJECT_DIR/cmd/tapvxlan-udp"
-        return 1
-    fi
-    info "Building tapvxlan-udp..."
-    mkdir -p "$(dirname "$BINARY_PATH")"
-    (
-        cd "$PROJECT_DIR" &&
-        GOPROXY="$GOPROXY_VALUE" go build -o "$BINARY_PATH" ./cmd/tapvxlan-udp
-    ) || return 1
-    chmod +x "$BINARY_PATH"
-    ok "Built binary: $BINARY_PATH"
 }
 
 is_running() {
@@ -457,7 +467,7 @@ start_tunnel() {
     need_root
     load_config
     check_env || return 1
-    build_binary || return 1
+    ensure_binary || return 1
 
     if is_running; then
         ok "Already running, pid=$(cat "$PID_FILE")"
@@ -481,7 +491,7 @@ start_tunnel() {
     sleep 1
     if ! kill -0 "$pid" >/dev/null 2>&1; then
         err "Process exited during startup. Log:"
-        tail -n 50 "$LOG_FILE" >&2
+        tail -n 80 "$LOG_FILE" >&2
         rm -f "$PID_FILE"
         return 1
     fi
@@ -514,6 +524,11 @@ stop_tunnel() {
     ip link delete "$TAP_IFACE" >/dev/null 2>&1 || true
 }
 
+restart_tunnel() {
+    stop_tunnel || true
+    start_tunnel
+}
+
 status_tunnel() {
     load_config
     show_config
@@ -527,20 +542,169 @@ status_tunnel() {
         echo
         ip -d link show "$TAP_IFACE"
     fi
+    if [ -n "$BRIDGE_IFACE" ] && ip link show "$BRIDGE_IFACE" >/dev/null 2>&1; then
+        echo
+        ip -d link show "$BRIDGE_IFACE"
+    fi
 }
 
-restart_tunnel() {
-    stop_tunnel || true
-    start_tunnel
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+status_json() {
+    load_config
+    running=false
+    pid=""
+    if is_running; then
+        running=true
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    fi
+    ts_ip=""
+    if command_exists tailscale; then
+        ts_ip="$(tailscale ip -4 2>/dev/null | head -n 1)"
+    fi
+    printf '{'
+    printf '"version":"%s",' "$(json_escape "$VERSION")"
+    printf '"running":%s,' "$running"
+    printf '"pid":"%s",' "$(json_escape "$pid")"
+    printf '"tap":"%s",' "$(json_escape "$TAP_IFACE")"
+    printf '"bridge":"%s",' "$(json_escape "$BRIDGE_IFACE")"
+    printf '"vni":"%s",' "$(json_escape "$VNI")"
+    printf '"listen":"%s",' "$(json_escape "$LOCAL_LISTEN")"
+    printf '"peers":"%s",' "$(json_escape "$PEERS")"
+    printf '"tailscale_ip":"%s",' "$(json_escape "$ts_ip")"
+    printf '"binary":"%s",' "$(json_escape "$BINARY_PATH")"
+    printf '"release":"%s"' "$(json_escape "$RELEASE_VERSION")"
+    printf '}\n'
 }
 
 show_logs() {
     load_config
     if [ -f "$LOG_FILE" ]; then
-        tail -n 120 "$LOG_FILE"
+        tail -n 160 "$LOG_FILE"
     else
         warn "No log file: $LOG_FILE"
     fi
+}
+
+doctor() {
+    load_config
+    show_config
+    echo
+    check_env || true
+    echo
+    info "Detected asset: $(detect_binary_asset 2>/dev/null || echo unknown)"
+    if [ -x "$BINARY_PATH" ]; then
+        "$BINARY_PATH" -h >/dev/null 2>&1 && ok "Binary is executable"
+    fi
+    if is_running; then
+        ok "Process running: $(cat "$PID_FILE")"
+    else
+        warn "Process not running"
+    fi
+    if [ -f "$LOG_FILE" ]; then
+        info "Recent log:"
+        tail -n 30 "$LOG_FILE"
+    fi
+}
+
+install_systemd_service() {
+    need_root
+    load_config
+    mkdir -p "$(dirname "$SCRIPT_INSTALL_PATH")"
+    if [ "$SCRIPT_PATH" != "$SCRIPT_INSTALL_PATH" ]; then
+        cp "$SCRIPT_PATH" "$SCRIPT_INSTALL_PATH"
+        chmod +x "$SCRIPT_INSTALL_PATH"
+    fi
+
+    cat >"$SYSTEMD_SERVICE_FILE" <<EOF
+[Unit]
+Description=User-space VXLAN over Tailscale
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SCRIPT_INSTALL_PATH start
+ExecStop=$SCRIPT_INSTALL_PATH stop
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$(basename "$SYSTEMD_SERVICE_FILE")"
+    ok "Installed systemd service: $SYSTEMD_SERVICE_FILE"
+}
+
+install_initd_service() {
+    need_root
+    load_config
+    mkdir -p "$(dirname "$SCRIPT_INSTALL_PATH")"
+    if [ "$SCRIPT_PATH" != "$SCRIPT_INSTALL_PATH" ]; then
+        cp "$SCRIPT_PATH" "$SCRIPT_INSTALL_PATH"
+        chmod +x "$SCRIPT_INSTALL_PATH"
+    fi
+
+    cat >"$INITD_SERVICE_FILE" <<EOF
+#!/bin/sh /etc/rc.common
+START=99
+STOP=10
+
+start() {
+    $SCRIPT_INSTALL_PATH start
+}
+
+stop() {
+    $SCRIPT_INSTALL_PATH stop
+}
+
+restart() {
+    $SCRIPT_INSTALL_PATH restart
+}
+EOF
+    chmod +x "$INITD_SERVICE_FILE"
+    "$INITD_SERVICE_FILE" enable >/dev/null 2>&1 || true
+    ok "Installed init.d service: $INITD_SERVICE_FILE"
+}
+
+enable_autostart() {
+    need_root
+    if command_exists systemctl && [ -d /etc/systemd/system ]; then
+        install_systemd_service
+    elif [ -d /etc/init.d ]; then
+        install_initd_service
+    else
+        err "No supported service manager found"
+        return 1
+    fi
+}
+
+disable_autostart() {
+    need_root
+    if command_exists systemctl && [ -f "$SYSTEMD_SERVICE_FILE" ]; then
+        systemctl disable "$(basename "$SYSTEMD_SERVICE_FILE")" >/dev/null 2>&1 || true
+        rm -f "$SYSTEMD_SERVICE_FILE"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ok "Removed systemd service"
+    fi
+    if [ -f "$INITD_SERVICE_FILE" ]; then
+        "$INITD_SERVICE_FILE" disable >/dev/null 2>&1 || true
+        rm -f "$INITD_SERVICE_FILE"
+        ok "Removed init.d service"
+    fi
+}
+
+uninstall() {
+    need_root
+    stop_tunnel || true
+    disable_autostart || true
+    rm -f "$BINARY_PATH"
+    ok "Removed binary: $BINARY_PATH"
+    warn "Config kept: $CONFIG_FILE"
 }
 
 edit_config_hint() {
@@ -555,9 +719,7 @@ edit_config_hint() {
     echo "  PHYS_IFACES=\"eth0\""
     echo "  LOCAL_LISTEN=\"0.0.0.0:${VXLAN_PORT}\""
     echo "  PEERS=\"peer-tailscale-ip:${VXLAN_PORT}\""
-    echo "  DOWNLOAD_BINARY=\"1\""
-    echo "  GITHUB_REPO=\"Frankzhang854/userspace-vxlan\""
-    echo "  RELEASE_VERSION=\"v0.1.0\""
+    echo "  RELEASE_VERSION=\"v0.2.0\""
 }
 
 menu() {
@@ -566,26 +728,36 @@ menu() {
         echo "User-space VXLAN over Tailscale control ($VERSION)"
         echo "1) Init default config"
         echo "2) Show config/status"
-        echo "3) Check environment"
-        echo "4) Build/download/install Go binary"
-        echo "5) Start tunnel"
-        echo "6) Stop tunnel"
-        echo "7) Restart tunnel"
-        echo "8) Show logs"
-        echo "9) Config edit hint"
+        echo "3) Doctor/check environment"
+        echo "4) Install binary from GitHub Release"
+        echo "5) Update binary from GitHub Release"
+        echo "6) Start tunnel"
+        echo "7) Stop tunnel"
+        echo "8) Restart tunnel"
+        echo "9) Show logs"
+        echo "10) Enable autostart"
+        echo "11) Disable autostart"
+        echo "12) Update this script from Release"
+        echo "13) Status JSON"
+        echo "14) Config edit hint"
         echo "0) Exit"
         printf "Select: "
         read -r choice
         case "$choice" in
             1) write_default_config ;;
             2) status_tunnel ;;
-            3) check_env ;;
-            4) need_root; build_binary ;;
-            5) start_tunnel ;;
-            6) stop_tunnel ;;
-            7) restart_tunnel ;;
-            8) show_logs ;;
-            9) edit_config_hint ;;
+            3) doctor ;;
+            4) install_binary ;;
+            5) update_binary ;;
+            6) start_tunnel ;;
+            7) stop_tunnel ;;
+            8) restart_tunnel ;;
+            9) show_logs ;;
+            10) enable_autostart ;;
+            11) disable_autostart ;;
+            12) update_script ;;
+            13) status_json ;;
+            14) edit_config_hint ;;
             0) exit 0 ;;
             *) warn "Unknown choice" ;;
         esac
@@ -597,17 +769,26 @@ usage() {
 Usage: $0 COMMAND
 
 Commands:
-  init-config     Create default config at $CONFIG_FILE
-  config          Show loaded config
-  check           Check TAP/Tailscale/bridge environment
-  build           Download or build/install tapvxlan-udp binary
-  install-binary  Alias of build
-  start           Start userspace VXLAN tunnel
-  stop            Stop userspace VXLAN tunnel
-  restart         Restart userspace VXLAN tunnel
-  status          Show config and runtime status
-  logs            Show recent logs
-  menu            Interactive menu
+  init-config       Create default config at $CONFIG_FILE
+  config            Show loaded config
+  check             Check TAP/Tailscale/bridge environment
+  doctor            Detailed diagnostics
+  install-binary    Download matching tapvxlan-udp binary from GitHub Release
+  update-binary     Force re-download matching binary
+  update-script     Download this control script from GitHub Release
+  start             Start userspace VXLAN tunnel
+  stop              Stop userspace VXLAN tunnel
+  restart           Restart userspace VXLAN tunnel
+  status            Show config and runtime status
+  status-json       Print machine-readable status JSON
+  logs              Show recent logs
+  enable-autostart  Install and enable systemd/init.d autostart
+  disable-autostart Disable and remove systemd/init.d autostart
+  uninstall         Stop tunnel, remove service and binary; keep config
+  menu              Interactive menu
+
+Compatibility aliases:
+  build             Alias of install-binary; no local Go build is performed
 
 Config override:
   VXLAN_TS_CONFIG=/path/to/config $0 start
@@ -620,12 +801,19 @@ main() {
         init-config) write_default_config ;;
         config) show_config ;;
         check) check_env ;;
-        build|install-binary) need_root; build_binary ;;
+        doctor) doctor ;;
+        build|install-binary) install_binary ;;
+        update-binary) update_binary ;;
+        update-script) update_script ;;
         start) start_tunnel ;;
         stop) stop_tunnel ;;
         restart) restart_tunnel ;;
         status) status_tunnel ;;
+        status-json) status_json ;;
         logs) show_logs ;;
+        enable-autostart) enable_autostart ;;
+        disable-autostart) disable_autostart ;;
+        uninstall) uninstall ;;
         menu) menu ;;
         -h|--help|help) usage ;;
         *) err "Unknown command: $cmd"; usage; exit 1 ;;
